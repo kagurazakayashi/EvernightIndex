@@ -1,0 +1,57 @@
+# --- 本地文档：不进入版本库 -------------------------------------------------
+# 需求草稿、交接规则与会话记忆只保留在本机；/A*.md 与 /M*.md 同时覆盖
+# AGENTS.md、MEMORY.md，以及后续任何以 A 或 M 开头的本地文档。
+/EvernightIndex_*.md
+/A*.md
+/M*.md
+.wpscomate
+
+# --- Go 构建产物 -----------------------------------------------------------
+# 仓库根目录直接 go build 产生的可执行文件，以及常见构建目录。
+/evernightindex
+/evernightindex.exe
+/bin/
+/build/
+/dist/
+/.build-out/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+/coverage/
+
+# --- 本地 SQLite 产物（手动试验用） ----------------------------------------
+# 只忽略运行期数据库与它的 WAL/journal 侧车文件，testdata 下的样本库照常纳入。
+/index.db
+/index.db-wal
+/index.db-shm
+/index.db-journal
+*.db-wal
+*.db-shm
+*.db-journal
+
+# --- 编辑器与操作系统杂项 ---------------------------------------------------
+.DS_Store
+.Spotlight-V100
+.Trashes
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- 本地临时目录与工作区文件 ----------------------------------------------
+/tmp/
+/.cache/
+/.verify-tmp/
+/go.work
+/go.work.sum
