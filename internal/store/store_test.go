@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -94,8 +95,8 @@ func TestOpenCreateWritesIdentity(t *testing.T) {
 		t.Fatalf("db_uuid = %q, err = %v", uuid, err)
 	}
 	version, err := store.Meta(ctx, "schema_version")
-	if err != nil || version != "1" {
-		t.Fatalf("schema_version = %q, err = %v", version, err)
+	if err != nil || version != strconv.FormatInt(SchemaVersion, 10) {
+		t.Fatalf("schema_version = %q, err = %v, want %d", version, err, SchemaVersion)
 	}
 
 	var applicationID, userVersion int64
@@ -240,6 +241,24 @@ func TestMissingDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "absent", "index.db")
 	_, err := Open(context.Background(), path, Options{})
 	requireCode(t, err, model.CodeDatabaseMissing)
+}
+
+// TestEmptyFileIsNotADatabase 驗證空檔案不會在未要求建立時被初始化。
+func TestEmptyFileIsNotADatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty.db")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("write empty file: %v", err)
+	}
+	_, err := Open(context.Background(), path, Options{})
+	requireCode(t, err, model.CodeDatabaseMissing)
+
+	created, err := Open(context.Background(), path, Options{Create: true})
+	if err != nil {
+		t.Fatalf("create over an empty file: %v", err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
 }
 
 // TestReadOnlyRejectsWrites 驗證唯讀開啟不會建立或修改資料庫。

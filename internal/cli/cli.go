@@ -69,12 +69,36 @@ func Main(ctx context.Context, build BuildInfo, argv []string, stdout, stderr io
 		return int(model.ExitOK)
 	}
 
-	service := app.New()
-	if err := service.Run(ctx, app.Request{Command: opts.command.name, Args: opts.args}); err != nil {
+	service := app.New(app.Deps{Console: console, Catalog: catalog, Lang: lang})
+	if err := service.Run(ctx, app.Request{
+		Command: opts.command.name,
+		Args:    opts.args,
+		Options: opts.appOptions(),
+	}); err != nil {
 		printError(catalog, lang, console, err, false)
 		return int(model.ExitCodeOf(err))
 	}
 	return int(model.ExitOK)
+}
+
+// appOptions 把解析結果轉成應用層參數。
+//
+// 只有已實作行為會讀取的欄位才轉換；命令專屬選項的預設值同樣來自集中宣告，
+// 因此這裡不需要另一份預設值。
+func (o *options) appOptions() app.Options {
+	return app.Options{
+		DB:            o.str("db"),
+		LogDir:        o.str("log-dir"),
+		TempDir:       o.str("temp-dir"),
+		SHA256:        o.boolValue("sha256"),
+		Deep:          o.boolValue("deep"),
+		ChangeLog:     o.boolValue("change-log"),
+		OneFileSystem: o.boolValue("one-file-system"),
+		Workers:       o.intValue("workers"),
+		ReadRetries:   o.intValue("read-retries"),
+		LockTimeout:   o.durationValue("lock-timeout"),
+		Excludes:      o.list("exclude"),
+	}
 }
 
 // printError 以目前語言輸出錯誤碼與說明。

@@ -64,6 +64,20 @@ const (
 	CodeDatabaseCorrupt ErrorCode = "E_DATABASE_CORRUPT"
 	// CodeDatabaseIO 表示資料庫讀寫失敗。
 	CodeDatabaseIO ErrorCode = "E_DATABASE_IO"
+	// CodeDatabaseLocked 表示在期限內無法取得正式資料庫的跨行程寫入鎖。
+	CodeDatabaseLocked ErrorCode = "E_DATABASE_LOCKED"
+	// CodeDatabaseUnknownSchema 表示資料庫標示的結構缺漏或無法辨識。
+	CodeDatabaseUnknownSchema ErrorCode = "E_DATABASE_UNKNOWN_SCHEMA"
+	// CodeRootMismatch 表示指定的根目錄與資料庫綁定的根目錄不一致。
+	CodeRootMismatch ErrorCode = "E_ROOT_MISMATCH"
+	// CodeIndexIncomplete 表示資料庫尚未完成任何一次發佈，不能當成完整索引查詢。
+	CodeIndexIncomplete ErrorCode = "E_INDEX_INCOMPLETE"
+	// CodePublishConflict 表示發佈前的代次或執行狀態檢查失敗，拒絕覆蓋他人結果。
+	CodePublishConflict ErrorCode = "E_PUBLISH_CONFLICT"
+	// CodePartial 表示部分完成：結果已發佈但有明確覆蓋缺口。
+	CodePartial ErrorCode = "E_PARTIAL"
+	// CodeExportPending 表示索引已發佈但變化日誌仍待匯出。
+	CodeExportPending ErrorCode = "E_EXPORT_PENDING"
 	// CodeInternal 表示不應發生的內部錯誤。
 	CodeInternal ErrorCode = "E_INTERNAL"
 	// CodeInterrupted 表示使用者中斷。

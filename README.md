@@ -8,9 +8,9 @@ This file is the English master; the other three editions mirror its structure a
 
 ## Status
 
-- Version `0.1.0-dev` (project skeleton). The command contract, the four message catalogs and the SQLite foundation are in place.
-- Every business command (`index`, `find`, `dupes`, `info`, `export-log`, `recover`) parses and validates its options, then exits with code `1` and an `E_NOT_IMPLEMENTED` message. `--help` and `--version` never create a database and never scan a directory.
-- Scanning, index creation and update, SHA256 hashing, change-log CSV export, queries, duplicate detection, temporary working copies and recovery are **not implemented yet**. The sections below describe the fixed contract; they do not claim working features.
+- Version `0.1.0-dev` (project skeleton plus the storage and run-control layer). The command contract, the four message catalogs, the SQLite foundation, schema version 2, staging and publish generations, the cross-process write lock, the run lifecycle and the per-second statistics are in place.
+- `info` is implemented as a read-only command: it reports the format version, database UUID, bound root, published generation, entry and digest coverage, the latest run and pending change-log exports. It never creates, migrates or locks a database.
+- Every other business command (`index`, `find`, `dupes`, `export-log`, `recover`) parses and validates its options, then exits with code `1` and an `E_NOT_IMPLEMENTED` message. Scanning, SHA256 hashing, change-log CSV export, queries, duplicate detection, temporary working copies and recovery are **not implemented yet**; the sections below describe the fixed contract and do not claim working features.
 
 ## Requirements
 
@@ -53,9 +53,10 @@ evernightindex --help
 evernightindex index --help
 evernightindex --lang zh-CN --help
 evernightindex index /data --help
+evernightindex info --db /data/index.db
 ```
 
-In `cmd` use double quotes around paths with spaces (`--db "C:\\my data\\index.db"`); in PowerShell single quotes are often simpler. Running `index /data` without `--help` currently fails with exit code `1` and touches nothing.
+In `cmd` use double quotes around paths with spaces (`--db "C:\\my data\\index.db"`); in PowerShell single quotes are often simpler. `info` opens an existing database read-only: without `--db` it exits with code `2`, and a missing, foreign, corrupt, newer or incomplete database is refused with a stable error code instead of being modified. Running `index /data` without `--help` still fails with code `1` and touches nothing.
 
 ## Commands
 
@@ -64,7 +65,7 @@ In `cmd` use double quotes around paths with spaces (`--db "C:\\my data\\index.d
 | `index` | `<dir>` | not implemented | Create or update the index of one directory |
 | `find` | none | not implemented | Query indexed entries by name, path or typed filter |
 | `dupes` | `<dir-a> <dir-b>` | not implemented | Compare two indexed directories for duplicate regular files |
-| `info` | none | not implemented | Show bound root, format version, run status and digest coverage |
+| `info` | none | implemented (read-only) | Show bound root, format version, run status and digest coverage |
 | `export-log` | none | not implemented | Export pending change-log events of one run |
 | `recover` | none | not implemented | Retry publishing a finished temporary working copy |
 
@@ -138,20 +139,26 @@ An invalid explicit value is an error (`E_INVALID_LANGUAGE`) and is never silent
 
 ## Output streams
 
-- stdout carries results only: query rows, duplicate groups, or explicitly requested structured output.
-- stderr carries progress, warnings, errors, per-path verbose records and the final statistics.
-- `--quiet` disables regular progress (errors stay visible), `--verbose` adds one line per processed path, and `--progress=false` disables progress explicitly. `--quiet` together with `--verbose` is rejected.
+- stdout carries results only: query rows, duplicate groups, the `info` report, or explicitly requested structured output.
+- stderr carries progress, warnings, errors, per-path verbose records and statistics.
+- During a run, statistics go to stderr once per second; a run that finishes in less than a second still prints a final summary, so processed, failed, error-event and published counts are always visible. Statistics keep discovered, processed, succeeded, failed, error events and published entries apart: processed does not mean saved, and a cancelled or rolled-back run keeps `published` at zero.
+- `--quiet` disables the regular progress **and** the final summary (errors are never suppressed), `--verbose` adds one line per processed path, and `--progress=false` disables only the per-second ticks while keeping the final summary. `--quiet` together with `--verbose` is rejected.
 
 ## Database foundation
 
 - Driver: `modernc.org/sqlite v1.62.0`, pure Go, no CGO. It was chosen after verifying transactions, cancellation, consistent backup and cross-compilation, not for the "pure Go" label alone.
-- Connection: a single pooled connection per process, WAL journal, `busy_timeout`, `foreign_keys=1`, `synchronous=NORMAL`.
-- Identity and version: `PRAGMA application_id = 0x45564E49` ("EVNI"), `PRAGMA user_version` mirrors the schema version (currently `1`), and `store_meta` holds `schema_version` and `db_uuid`.
+- Connection: a single pooled connection per process, WAL journal, `busy_timeout`, `foreign_keys=1`, `synchronous=NORMAL`. Read-only connections never switch the journal mode, because that writes the database header.
+- Identity and version: `PRAGMA application_id = 0x45564E49` ("EVNI"), `PRAGMA user_version` mirrors the schema version (currently `2`), and `store_meta` holds `schema_version` and `db_uuid`.
+- Schema version 2: `root_dir` (exactly one bound root per database), `run` (one row per run with status, baseline and published generation, coverage and counters), `entry` (published entries keyed by root and path), `entry_stage` (staged changes of the running run), `entry_event` (change events of a run) and `change_export` (pending CSV export state). NULL always means "not available or not applicable" and never stands for 0 or an empty string: a directory has no `size_bytes`, an entry without a digest has no `hash_sha256`, and `btime_utc` stays NULL when the platform cannot report a creation time.
+- Staging and publish: scanning writes only to `entry_stage`; one publish transaction copies the staged rows into `entry`, applies staged deletions, writes the change events, bumps `root_dir.published_generation` and marks the run published. Readers therefore see a complete generation or the previous one, never a half update, and a failing publish transaction rolls back entirely. The first creation stays unpublished (`published_generation` NULL) until a commit succeeds, so an interrupted first run is never presented as a complete index. A partial sweep is published with `coverage = partial` plus the recorded gaps.
+- Write lock: every write path takes the cross-process lock `<database>.evernightindex.lock` before opening the database for writing (`store.OpenTarget` refuses a writable open without the matching lock). It is an operating-system byte-range lock, so the process ending releases it even after a crash. Waiting honours `--lock-timeout` and is cancellable; the lock file stays on disk and records the current holder for diagnostics only.
+- Runs: a run moves from `running` to `published`, `failed`, `interrupted` or `aborted`; a leftover `running` row is marked `abandoned` by the next run that holds the lock. Publishing compares the generation read at start, so a result that was superseded meanwhile is refused instead of overwritten (`E_PUBLISH_CONFLICT`).
 - Transactions: `store.WithTx` commits on success and always rolls back otherwise, so callers only ever observe a committed or an uncommitted state. A cancelled context is passed through to the driver.
 - Consistent backup: `store.Backup` runs `VACUUM INTO` into a temporary file next to the target and renames it afterwards. It never copies a main file that may be missing data still held in the WAL, and it refuses an existing target.
-- Refusals: a file created by another program, a newer format version, a directory path or a missing database yields a stable error code (`E_DATABASE_FOREIGN`, `E_DATABASE_VERSION_TOO_NEW`, `E_DATABASE_MISSING`, `E_DATABASE_IO`).
+- Refusals: a file created by another program, a newer format version, an unknown or incomplete schema, a corrupt file, a missing database, a database path that is a directory and a root that differs from the bound one yield stable error codes (`E_DATABASE_FOREIGN`, `E_DATABASE_VERSION_TOO_NEW`, `E_DATABASE_UNKNOWN_SCHEMA`, `E_DATABASE_CORRUPT`, `E_DATABASE_MISSING`, `E_DATABASE_IO`, `E_ROOT_MISMATCH`) and nothing is overwritten.
+- Migration: only explicitly supported older versions are migrated (version 1 to 2); a version 1 file that holds tables the migration does not know is refused instead of being rebuilt.
 
-Verified by `go test ./internal/store` on Windows amd64 (real execution): creation with WAL, commit, rollback visibility, consistent snapshot that excludes an uncommitted transaction, backup integrity check, `PRAGMA integrity_check`, cancellation in the middle of a long query with a usable connection afterwards, read-only open rejecting writes, rejection of a foreign database and of a newer format version, and rejection of a directory given as a database path.
+Verified on Windows amd64 by real execution (`go test ./internal/store ./internal/app ./internal/output ./internal/cli`): creation with WAL, commit, rollback visibility, consistent snapshot that excludes an uncommitted transaction, backup integrity check, `PRAGMA integrity_check`, cancellation in the middle of a long query with a usable connection afterwards, read-only open rejecting writes, staged entries invisible before the publish and visible after it, a failed publish transaction leaving the previous generation and entries untouched, generation conflicts, an interrupted first creation staying unpublished, partial coverage with recorded gaps, change events and pending exports committing with the index, version 1 migration preserving the database UUID, refusal of foreign, too-new, unknown and corrupt databases, root mismatch, and a second process holding the lock (contention, timeout, cancellation, and the lock being released when that process exits while the previous index stays intact and passes the integrity check).
 
 ## Platform verification
 
@@ -165,18 +172,18 @@ Cross-compiling is not runtime verification. Platform-specific metadata collecti
 
 ## Not implemented yet
 
-Scanning with exclusions and one-file-system limits; platform metadata collection; streamed SHA256 with read-stability checks; index creation and fast/deep update with conservative deletion rules; change-log CSV export and retry; typed filters, field selection and JSONL/CSV/NUL output; duplicate detection with `auto`/`metadata`/`sha256` plus on-demand verification; temporary working copies with publish and recovery; per-second statistics.
+Scanning with exclusions and one-file-system limits; platform metadata collection (this step only models the fields); streamed SHA256 with read-stability checks; index creation and fast/deep update with conservative deletion rules; change-log CSV export and retry; typed filters, field selection and JSONL/CSV/NUL output; duplicate detection with `auto`/`metadata`/`sha256` plus on-demand verification; temporary working copies with publish and recovery. `info` is implemented, and the statistics, run lifecycle, staging and publish boundary and write lock are in place and verified with synthetic entries, not with a real scanner yet.
 
 ## Project layout
 
 ```text
-cmd/evernightindex      entry point, version injection, exit-code hand-over
+cmd/evernightindex      entry point, version injection, two-stage interrupt, exit-code hand-over
 internal/cli            option registry, parser, help, dispatch
-internal/app            task orchestration (currently rejects unimplemented commands)
-internal/model          stable error codes and exit codes
-internal/store          SQLite open/identity/transaction/backup foundation
+internal/app            run lifecycle (lock, run record, publish or abandon), info report, output layer
+internal/model          domain types, stable error codes and exit codes
+internal/store          SQLite schema and migration, staging and publish, write lock, backup
 internal/platform       per-OS facts (system locale) behind build tags
-internal/output         stdout/stderr separation and verbosity
+internal/output         stdout/stderr separation, verbosity, thread-safe statistics, per-second ticks
 internal/i18n           four message catalogs, language resolution, catalog checks
 ```
 

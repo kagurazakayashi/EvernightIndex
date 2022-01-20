@@ -106,7 +106,7 @@ var commandRegistry = []commandSpec{
 	{name: "index", argSpec: "<dir>", argMin: 1, argMax: 1, summaryKey: "cmd.index.summary", implemented: false},
 	{name: "find", argSpec: "", argMin: 0, argMax: 0, summaryKey: "cmd.find.summary", implemented: false},
 	{name: "dupes", argSpec: "<dir-a> <dir-b>", argMin: 2, argMax: 2, summaryKey: "cmd.dupes.summary", implemented: false},
-	{name: "info", argSpec: "", argMin: 0, argMax: 0, summaryKey: "cmd.info.summary", implemented: false},
+	{name: "info", argSpec: "", argMin: 0, argMax: 0, summaryKey: "cmd.info.summary", implemented: true},
 	{name: "export-log", argSpec: "", argMin: 0, argMax: 0, summaryKey: "cmd.export-log.summary", implemented: false},
 	{name: "recover", argSpec: "", argMin: 0, argMax: 0, summaryKey: "cmd.recover.summary", implemented: false},
 }

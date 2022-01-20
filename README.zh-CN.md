@@ -8,9 +8,9 @@ EvernightIndex 是使用 Go 开发的 Windows、macOS、Linux 命令行工具，
 
 ## 当前状态
 
-- 版本 `0.1.0-dev`（工程骨架）。命令契约、四语言消息资源与 SQLite 基础已就位。
-- 全部业务命令（`index`、`find`、`dupes`、`info`、`export-log`、`recover`）只做参数解析与校验，随后以退出码 `1` 和 `E_NOT_IMPLEMENTED` 说明失败。`--help` 与 `--version` 不会建立数据库，也不会扫描目录。
-- 扫描、索引创建与更新、SHA256 计算、变化日志 CSV、查询、重复检测、临时工作副本与恢复**尚未实现**。下列章节描述已经固定的契约，不代表这些功能可用。
+- 版本 `0.1.0-dev`（工程骨架并已加入存储与运行控制层）。命令契约、四语言消息资源、SQLite 基础、schema 版本 2、暂存与发布代次、跨进程写入锁、运行生命周期与每秒统计已就位。
+- `info` 已实现为只读命令：报告格式版本、数据库 UUID、绑定根目录、已发布代次、条目与摘要覆盖率、最近一次运行以及待导出日志。它不会建立、迁移或锁定数据库。
+- 其余业务命令（`index`、`find`、`dupes`、`export-log`、`recover`）只做参数解析与校验，随后以退出码 `1` 和 `E_NOT_IMPLEMENTED` 说明失败。扫描、SHA256 计算、变化日志 CSV、查询、重复检测、临时工作副本与恢复**尚未实现**；下列章节描述已经固定的契约，不代表这些功能可用。
 
 ## 环境要求
 
@@ -53,9 +53,10 @@ evernightindex --help
 evernightindex index --help
 evernightindex --lang zh-CN --help
 evernightindex index /data --help
+evernightindex info --db /data/index.db
 ```
 
-`cmd` 中路径含空格时用双引号（`--db "C:\\我的 数据\\index.db"`）；PowerShell 中用单引号通常更省事。不带 `--help` 直接运行 `index /data` 目前会以退出码 `1` 失败，且不改动任何文件。
+`cmd` 中路径含空格时用双引号（`--db "C:\\我的 数据\\index.db"`）；PowerShell 中用单引号通常更省事。`info` 以只读方式打开既有数据库：缺少 `--db` 时以退出码 `2` 失败，数据库缺失、非本程序建立、损坏、版本较新或索引不完整时以稳定错误码拒绝，不会修改任何文件。不带 `--help` 直接运行 `index /data` 仍会以退出码 `1` 失败，且不改动任何文件。
 
 ## 命令
 
@@ -64,7 +65,7 @@ evernightindex index /data --help
 | `index` | `<目录>` | 尚未实现 | 创建或更新一个目录的索引 |
 | `find` | 无 | 尚未实现 | 按名称、路径或类型化筛选查询已索引条目 |
 | `dupes` | `<目录A> <目录B>` | 尚未实现 | 比较两个已索引目录中的重复普通文件 |
-| `info` | 无 | 尚未实现 | 显示绑定根目录、格式版本、运行状态与摘要覆盖率 |
+| `info` | 无 | 已实现（只读） | 显示绑定根目录、格式版本、运行状态与摘要覆盖率 |
 | `export-log` | 无 | 尚未实现 | 导出某一次运行中待导出的变化日志事件 |
 | `recover` | 无 | 尚未实现 | 重试发布已完成且校验通过的临时工作副本 |
 
@@ -138,20 +139,26 @@ evernightindex index /data --help
 
 ## 输出流
 
-- 标准输出只放结果：查询行、重复分组或明确要求的结构化输出。
-- 标准错误放进度、警告、错误、逐路径详细记录与最终统计。
-- `--quiet` 关闭常规进度（错误仍显示），`--verbose` 增加逐路径记录，`--progress=false` 显式关闭进度。`--quiet` 与 `--verbose` 同时使用会被拒绝。
+- 标准输出只放结果：查询行、重复分组、`info` 报告或明确要求的结构化输出。
+- 标准错误放进度、警告、错误、逐路径详细记录与统计。
+- 运行期间每秒向标准错误输出一次统计；不足一秒的运行也会输出最终汇总，因此已处理、失败、错误事件与已发布数量始终可见。统计把已发现、已处理、成功、失败、错误事件与已发布分开：已处理不代表已保存，取消或回滚后已发布数量保持 0。
+- `--quiet` 关闭常规进度**与**最终汇总（错误永不屏蔽），`--verbose` 增加逐路径记录，`--progress=false` 只关闭每秒节拍并保留最终汇总。`--quiet` 与 `--verbose` 同时使用会被拒绝。
 
 ## 数据库基础
 
 - 驱动：`modernc.org/sqlite v1.62.0`，纯 Go、无需 CGO。选型依据是实测事务、取消、一致性备份与跨平台构建，而不是「纯 Go」这个标签本身。
 - 连接：每进程单个连接池，WAL 日志，`busy_timeout`、`foreign_keys=1`、`synchronous=NORMAL`。
-- 识别与版本：`PRAGMA application_id = 0x45564E49`（"EVNI"），`PRAGMA user_version` 与 schema 版本（当前 `1`）一致，`store_meta` 表保存 `schema_version` 与 `db_uuid`。
+- 识别与版本：`PRAGMA application_id = 0x45564E49`（"EVNI"），`PRAGMA user_version` 与 schema 版本（当前 `2`）一致，`store_meta` 表保存 `schema_version` 与 `db_uuid`。只读连接不会切换日志模式，因为那需要写入数据库头部。
+- schema 版本 2：`root_dir`（每个数据库恰好一个绑定根目录）、`run`（每次运行一行，含状态、基线代次与已发布代次、覆盖状态与计数）、`entry`（已发布条目，以根目录与路径为键）、`entry_stage`（本次运行的暂存变更）、`entry_event`（变化事件）与 `change_export`（待导出状态）。NULL 一律表示「不可得或不适用」，绝不等同 0 或空字符串：目录没有 `size_bytes`、无摘要的条目没有 `hash_sha256`、平台无法提供创建时间时 `btime_utc` 保持 NULL。
+- 暂存与发布：扫描只写 `entry_stage`；一个发布交易把暂存行搬入 `entry`、套用暂存删除、写入变化事件、递增 `root_dir.published_generation` 并把运行标记为已发布。因此读取方只会看到完整代次或上一代次，不会看到半次更新；发布交易失败则整批回滚。首次建立直到提交成功前都保持未发布（`published_generation` 为 NULL），被中断的首次运行不会呈现为完整索引。部分完成的扫描可以发布，但状态为 `coverage = partial` 并记录缺口。
+- 写入锁：所有写入口在写模式打开数据库前先取得跨进程锁 `<数据库>.evernightindex.lock`（`store.OpenTarget` 拒绝没有匹配锁的写入开启）。锁是操作系统的字节范围锁，进程结束（含崩溃）即被释放。等待受 `--lock-timeout` 限制且可被取消；锁文件留在原处，其中记录的持有者仅供诊断。
+- 运行状态：一次运行从 `running` 转到 `published`、`failed`、`interrupted` 或 `aborted`；残留的 `running` 行会被下一个持有锁的运行标记为 `abandoned`。发布前会比对开始时的代次，已被他人覆盖的结果会被拒绝而不是被覆盖（`E_PUBLISH_CONFLICT`）。
 - 事务：`store.WithTx` 成功则提交，否则一定回滚，调用方只会看到「已提交」或「未提交」两种状态；取消信号会传递给驱动。
 - 一致性备份：`store.Backup` 使用 `VACUUM INTO` 写入目标目录的临时文件后再更名，不裸复制可能遗漏 WAL 内容的主文件，并拒绝覆盖已存在的目标。
-- 拒绝处理：其他程序建立的数据库、较新的格式版本、目录路径或缺失的数据库都会得到稳定错误码（`E_DATABASE_FOREIGN`、`E_DATABASE_VERSION_TOO_NEW`、`E_DATABASE_MISSING`、`E_DATABASE_IO`）。
+- 拒绝处理：其他程序建立的数据库、较新的格式版本、未知或不完整的结构、损坏的文件、缺失的数据库、把目录当数据库路径，以及绑定根目录不一致，都会得到稳定错误码（`E_DATABASE_FOREIGN`、`E_DATABASE_VERSION_TOO_NEW`、`E_DATABASE_UNKNOWN_SCHEMA`、`E_DATABASE_CORRUPT`、`E_DATABASE_MISSING`、`E_DATABASE_IO`、`E_ROOT_MISMATCH`），且不会覆盖任何内容。
+- 迁移：只迁移明确支持的旧版本（版本 1 到 2）；版本 1 文件中若含迁移不认识的表，直接拒绝，不自动重建。
 
-在 Windows amd64 上由 `go test ./internal/store` 实际执行验证：WAL 建库、提交、回滚可见性、排除未提交事务的一致性快照、备份完整性检查、`PRAGMA integrity_check`、长查询中途取消且之后连接可继续使用、只读打开拒绝写入、拒绝外来数据库与较新版本、拒绝把目录当数据库路径。
+在 Windows amd64 上由 `go test ./internal/store ./internal/app ./internal/output ./internal/cli` 实际执行验证：WAL 建库、提交、回滚可见性、排除未提交事务的一致性快照、备份完整性检查、`PRAGMA integrity_check`、长查询中途取消且之后连接可继续使用、只读打开拒绝写入、暂存条目发布前不可见发布后可见、发布交易失败时旧代次与旧条目完全不变、代次冲突、首次建立被中断后保持未发布、部分完成与缺口记录、变化事件与待导出状态随索引同交易提交、版本 1 迁移保留数据库 UUID、拒绝外来/较新版本/未知结构/损坏的数据库、根目录不一致，以及第二个进程持有锁时的竞争、逾时、取消与「持有进程结束后锁被释放且旧索引完整并通过完整性检查」。
 
 ## 平台验证状态
 
@@ -165,18 +172,18 @@ evernightindex index /data --help
 
 ## 尚未实现
 
-带排除规则与单文件系统限制的扫描；平台元数据采集；带读取稳定性检查的流式 SHA256；索引创建与快速/细致更新及保守删除判定；变化日志 CSV 导出与重试；类型化筛选、字段选择与 JSONL/CSV/NUL 输出；`auto`/`metadata`/`sha256` 重复检测与现场复核；临时工作副本的发布与恢复；每秒统计。
+带排除规则与单文件系统限制的扫描；平台元数据采集（本步骤只定义了字段）；带读取稳定性检查的流式 SHA256；索引创建与快速/细致更新及保守删除判定；变化日志 CSV 导出与重试；类型化筛选、字段选择与 JSONL/CSV/NUL 输出；`auto`/`metadata`/`sha256` 重复检测与现场复核；临时工作副本的发布与恢复。`info` 已实现；统计、运行生命周期、暂存与发布边界以及写入锁已就位，并以合成条目验证，尚未接入真实扫描器。
 
 ## 目录结构
 
 ```text
-cmd/evernightindex      入口、版本注入、退出码交接
+cmd/evernightindex      入口、版本注入、两段式中断处理、退出码交接
 internal/cli            参数集中声明、解析、帮助、分派
-internal/app            任务编排（当前拒绝执行未实现命令）
-internal/model          稳定错误码与退出码
-internal/store          SQLite 打开、识别、事务与备份基础
+internal/app            运行生命周期（锁、运行记录、发布或放弃）、info 报告、输出层
+internal/model          领域类型、稳定错误码与退出码
+internal/store          SQLite 结构定义与迁移、暂存与发布、写入锁、备份
 internal/platform       以构建标签隔离的系统事实（系统语言）
-internal/output         标准输出/标准错误分流与详细度
+internal/output         标准输出/标准错误分流、详细度、线程安全统计、每秒节拍
 internal/i18n           四语言消息资源、语言解析、资源检查
 ```
 

@@ -3,9 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kagurazakayashi/EvernightIndex/internal/store"
 )
 
 // 這些測試以記憶體輸出直接呼叫 Main，讓退出碼、訊息語言與檔案副作用
@@ -145,7 +149,6 @@ func TestNotImplementedCommandsFailLoudly(t *testing.T) {
 		{"index", dir},
 		{"find"},
 		{"dupes", dir, dir},
-		{"info"},
 		{"export-log"},
 		{"recover"},
 	}
@@ -280,6 +283,85 @@ func TestInterruptedContextMapsToExit130(t *testing.T) {
 		t.Errorf("stderr missing E_INTERRUPTED: %q", stderr.String())
 	}
 	requireEmptyDir(t, dir)
+}
+
+// TestInfoCommand 驗證 info 的參數要求、錯誤目標拒絕與輸出分流。
+//
+// info 是本步驟唯一實作的唯讀命令，用來證明資料庫識別、版本與綁定狀態
+// 確實能從 CLI 一路走到儲存層，而且診斷與結果不會混流。
+func TestInfoCommand(t *testing.T) {
+	withSystemLanguage(t, "")
+	dir := t.TempDir()
+
+	cases := []struct {
+		name     string
+		argv     []string
+		wantCode int
+		wantErr  string
+	}{
+		{"missing db option", []string{"info"}, 2, "E_MISSING_ARGUMENT"},
+		{"missing database", []string{"info", "--db", filepath.Join(dir, "absent.db")}, 1, "E_DATABASE_MISSING"},
+		{"database path is a directory", []string{"info", "-d", dir}, 1, "E_DATABASE_IO"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			result := runCLI(t, testCase.argv, nil)
+			if result.code != testCase.wantCode {
+				t.Errorf("exit code = %d, want %d (stderr: %s)", result.code, testCase.wantCode, result.stderr)
+			}
+			if result.stdout != "" {
+				t.Errorf("failed info must not write stdout: %q", result.stdout)
+			}
+			if !strings.Contains(result.stderr, testCase.wantErr) {
+				t.Errorf("stderr missing %s: %q", testCase.wantErr, result.stderr)
+			}
+		})
+	}
+	if _, err := os.Stat(filepath.Join(dir, "absent.db")); !os.IsNotExist(err) {
+		t.Errorf("info must not create the database: %v", err)
+	}
+
+	// 非本程式建立的資料庫不得被接受。
+	foreignPath := filepath.Join(dir, "foreign.db")
+	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(foreignPath))
+	if err != nil {
+		t.Fatalf("open foreign database: %v", err)
+	}
+	if _, err := raw.Exec("CREATE TABLE other(value TEXT)"); err != nil {
+		t.Fatalf("create foreign table: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close foreign database: %v", err)
+	}
+	foreign := runCLI(t, []string{"info", "--db", foreignPath}, nil)
+	if foreign.code != 1 || !strings.Contains(foreign.stderr, "E_DATABASE_FOREIGN") {
+		t.Errorf("foreign database: code=%d stderr=%q", foreign.code, foreign.stderr)
+	}
+	if foreign.stdout != "" {
+		t.Errorf("foreign database must not print results: %q", foreign.stdout)
+	}
+
+	// 正常空庫：完整報告寫入 stdout，stderr 保持乾淨。
+	dbPath := filepath.Join(dir, "index.db")
+	created, err := store.Open(context.Background(), dbPath, store.Options{Create: true})
+	if err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	if err := created.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+	report := runCLI(t, []string{"info", "--db", dbPath}, nil)
+	if report.code != 0 {
+		t.Fatalf("info exit code = %d, stderr = %q", report.code, report.stderr)
+	}
+	for _, want := range []string{"schema_version: 2", "root: unbound", "index_state: incomplete", "entries: 0", "pending_exports: 0"} {
+		if !strings.Contains(report.stdout, want) {
+			t.Errorf("info output is missing %q: %s", want, report.stdout)
+		}
+	}
+	if report.stderr != "" {
+		t.Errorf("successful info must keep stderr clean: %q", report.stderr)
+	}
 }
 
 func firstLines(text string, count int) string {
