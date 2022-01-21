@@ -10,7 +10,8 @@ This file is the English master; the other three editions mirror its structure a
 
 - Version `0.1.0-dev` (project skeleton plus the storage and run-control layer). The command contract, the four message catalogs, the SQLite foundation, schema version 2, staging and publish generations, the cross-process write lock, the run lifecycle and the per-second statistics are in place.
 - `info` is implemented as a read-only command: it reports the format version, database UUID, bound root, published generation, entry and digest coverage, the latest run and pending change-log exports. It never creates, migrates or locks a database.
-- Every other business command (`index`, `find`, `dupes`, `export-log`, `recover`) parses and validates its options, then exits with code `1` and an `E_NOT_IMPLEMENTED` message. Scanning, SHA256 hashing, change-log CSV export, queries, duplicate detection, temporary working copies and recovery are **not implemented yet**; the sections below describe the fixed contract and do not claim working features.
+- The traversal and metadata modules (`internal/scan`, `internal/fsmeta`) and the shared pattern matcher (`internal/match`) are implemented and covered by real tests on Windows; no command calls them yet, so no CLI path scans a tree. See "Scanning and metadata" below for the exact behavior.
+- Every other business command (`index`, `find`, `dupes`, `export-log`, `recover`) parses and validates its options, then exits with code `1` and an `E_NOT_IMPLEMENTED` message. Wiring the scanner to `index`, SHA256 hashing, change-log CSV export, queries, duplicate detection, temporary working copies and recovery are **not implemented yet**; the sections below describe the fixed contract and do not claim working features.
 
 ## Requirements
 
@@ -168,11 +169,33 @@ Verified on Windows amd64 by real execution (`go test ./internal/store ./interna
 | macOS arm64 and amd64 | cross-compiled | no | `CGO_ENABLED=0` cross build only; `defaults` locale detection is untested |
 | Linux amd64 | cross-compiled | no | `CGO_ENABLED=0` cross build only; tests were not executed on Linux |
 
-Cross-compiling is not runtime verification. Platform-specific metadata collection still has to be implemented and verified per platform.
+Cross-compiling is not runtime verification. The scanner and the metadata collector are verified by real tests on Windows; the macOS and Linux implementations are compiled and their test binaries compile for those targets, but they were not executed there.
+
+## Scanning and metadata
+
+The traversal and metadata modules are in place and tested, but the `index` command is not wired to them yet, so nothing below is reachable from the CLI in this build.
+
+- Paths come from exactly one place. Every explicit relative path (database, log directory, temporary directory, root) is resolved against the working directory captured when the process starts, never against the process working directory later and never against the scan root or a temporary directory. The root is made absolute and its symlinks are resolved once, so the same directory always yields the same relative paths.
+- Traversal records the root itself, hidden entries, empty directories and every accessible descendant. A directory whose modification time did not change is still descended: a stable mtime is not proof that a subtree is unchanged.
+- Links are never followed. Symlinks, Windows junctions and every other reparse point are recorded as the jump object itself, so there is no cycle and no access outside the root, and the target text is stored with a state of `resolved`, `dangling` or `unreadable`. FIFOs, sockets and device files are read for metadata only and are never opened, so a FIFO without a writer cannot block the scan.
+- Fields: type, size (regular files only), Go file mode, mtime and atime, birth time when the platform reports it, metadata change time, POSIX uid/gid/device/inode/link count, Windows attribute bits/volume serial/64-bit file ID/reparse tag, and macOS BSD flags. Unix `ctime` is never stored as a creation time, and an unavailable field stays NULL instead of 0.
+
+| Platform | Birth time | Change time | Other extensions | How it is read |
+| --- | --- | --- | --- | --- |
+| Windows | creation time | `FILE_BASIC_INFO.ChangeTime` | attribute bits, volume serial, 64-bit file ID, reparse tag, link count | one `lstat` plus a handle opened with `FILE_READ_ATTRIBUTES` only |
+| macOS | `lstat` birth time | `lstat` ctime | BSD flags, uid/gid, device, inode, link count | a single `lstat` |
+| Linux | `statx` `STATX_BTIME` | `lstat` ctime | uid/gid, device, inode, link count | `lstat` plus one `statx` call |
+
+- Path encoding keeps raw bytes. The relative path, the name and the comparison key keep the original bytes; display and log output escape control characters and invalid UTF-8 bytes as `\xNN`, and that escaping is reversible. A name with spaces, a newline or a leading dash, and a non-UTF-8 name on Unix, therefore stay distinguishable and lossless. Windows cannot represent a newline in a file name, so that sample is verified only on the other platforms.
+- Pattern semantics are defined once in the shared matcher. Both `/` and `\` are separators and there is no escape character; `*` matches any run of non-separator characters, `?` exactly one, `[abc]` / `[a-z]` / `[!abc]` a character class; `**` matches zero or more whole path segments but only as a whole segment; a leading `/` anchors to the root, a pattern with no separator matches the name of an entry at any depth, and a trailing `/` restricts the pattern to directories. Matching follows the case policy recorded for the root, and an invalid pattern is reported as `E_INVALID_PATTERN`.
+- Exclusions cover explicit patterns, the artifacts this program produces (the database, its `-journal`/`-wal`/`-shm` companions and the `<database>.evernightindex.lock` file), the configured change-log directory and the working subdirectory of the current run. Only those explicit files and directories are excluded, so a temporary parent directory keeps indexing unrelated user files.
+- Coverage evidence stays explicit. Successful enumeration, partial enumeration, enumeration failure, excluded entries and an invalid root are separate events, and the gaps are recorded as a prefix list. Only a successfully enumerated directory can later justify removing a missing entry; an excluded, failed or cross-file-system subtree never can. An unknown total is never turned into a percentage.
+- Concurrency and cancellation are bounded: directory enumeration runs on at most `max(1, logical CPUs / 2)` workers (default 1) with bounded queues, one consumer hands entry batches to the caller and one consumer emits events. One unreadable entry or directory is recorded and the scan continues; cancellation stops new work and reports the result as incomplete.
+- This step reads no ordinary file content. No SHA256 is computed and no file data is opened; a metadata handle on Windows asks for attributes only.
 
 ## Not implemented yet
 
-Scanning with exclusions and one-file-system limits; platform metadata collection (this step only models the fields); streamed SHA256 with read-stability checks; index creation and fast/deep update with conservative deletion rules; change-log CSV export and retry; typed filters, field selection and JSONL/CSV/NUL output; duplicate detection with `auto`/`metadata`/`sha256` plus on-demand verification; temporary working copies with publish and recovery. `info` is implemented, and the statistics, run lifecycle, staging and publish boundary and write lock are in place and verified with synthetic entries, not with a real scanner yet.
+The scanning, metadata and pattern modules are implemented and tested, but the `index` command is not wired to them yet. Still missing: streamed SHA256 with read-stability checks; index creation and fast/deep update with conservative deletion rules; change-log CSV export and retry; typed filters, field selection and JSONL/CSV/NUL output; duplicate detection with `auto`/`metadata`/`sha256` plus on-demand verification; temporary working copies with publish and recovery. `info` is implemented, and the statistics, run lifecycle, staging and publish boundary and write lock are in place.
 
 ## Project layout
 
@@ -182,6 +205,9 @@ internal/cli            option registry, parser, help, dispatch
 internal/app            run lifecycle (lock, run record, publish or abandon), info report, output layer
 internal/model          domain types, stable error codes and exit codes
 internal/store          SQLite schema and migration, staging and publish, write lock, backup
+internal/fsmeta         per-OS metadata collection, identity comparison, case-policy probe
+internal/scan           traversal, exclusions, one-file-system scope, coverage events
+internal/match          shared name/path wildcard matcher
 internal/platform       per-OS facts (system locale) behind build tags
 internal/output         stdout/stderr separation, verbosity, thread-safe statistics, per-second ticks
 internal/i18n           four message catalogs, language resolution, catalog checks

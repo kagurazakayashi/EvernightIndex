@@ -78,6 +78,12 @@ const (
 	CodePartial ErrorCode = "E_PARTIAL"
 	// CodeExportPending 表示索引已發佈但變化日誌仍待匯出。
 	CodeExportPending ErrorCode = "E_EXPORT_PENDING"
+	// CodeInvalidPattern 表示排除或查詢用的名稱/路徑模式不合法。
+	CodeInvalidPattern ErrorCode = "E_INVALID_PATTERN"
+	// CodeRootUnavailable 表示掃描根目錄不存在、無法存取或身份明顯不符。
+	CodeRootUnavailable ErrorCode = "E_ROOT_UNAVAILABLE"
+	// CodeScanIO 表示讀取檔案系統資訊失敗；這不是「檔案已刪除」。
+	CodeScanIO ErrorCode = "E_SCAN_IO"
 	// CodeInternal 表示不應發生的內部錯誤。
 	CodeInternal ErrorCode = "E_INTERNAL"
 	// CodeInterrupted 表示使用者中斷。

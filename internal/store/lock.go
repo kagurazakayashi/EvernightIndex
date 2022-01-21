@@ -28,7 +28,9 @@ import (
 // 但都必須在持有本鎖的前提下進行，不能以工作副本鎖代替。
 
 // LockSuffix 是正式目標鎖檔在資料庫路徑後的固定後綴。
-const LockSuffix = ".evernightindex.lock"
+//
+// 值的唯一來源在 model 套件：掃描層要排除鎖檔，但不該依賴儲存層。
+const LockSuffix = model.LockFileSuffix
 
 // DefaultLockPoll 是等待鎖時的輪詢間隔。
 const DefaultLockPoll = 50 * time.Millisecond
