@@ -190,18 +190,26 @@ type Coverage struct {
 	FailedDirs []Gap
 	// ExcludedDirs 是被排除且未進入的目錄。
 	ExcludedDirs []Excluded
+	// FailedEntries 是單一條目失敗的紀錄。
+	//
+	// 掃描本身只產生目錄級缺口；索引層在摘要失敗或條目採集失敗時
+	// 把具體路徑補進這裡，讓「部分完成」能說明是哪些檔案沒有成功，
+	// 而不必重新掃描或猜測。
+	FailedEntries []Gap
 }
 
 // Complete 表示沒有任何覆蓋缺口。
 func (c Coverage) Complete() bool {
-	return len(c.PartialDirs) == 0 && len(c.FailedDirs) == 0 && len(c.ExcludedDirs) == 0
+	return len(c.PartialDirs) == 0 && len(c.FailedDirs) == 0 &&
+		len(c.ExcludedDirs) == 0 && len(c.FailedEntries) == 0
 }
 
 // coverageJSON 是 Coverage 的穩定 JSON 表示。
 type coverageJSON struct {
-	PartialDirs  []gapJSON      `json:"partial_dirs"`
-	FailedDirs   []gapJSON      `json:"failed_dirs"`
-	ExcludedDirs []excludedJSON `json:"excluded_dirs"`
+	PartialDirs   []gapJSON      `json:"partial_dirs"`
+	FailedDirs    []gapJSON      `json:"failed_dirs"`
+	ExcludedDirs  []excludedJSON `json:"excluded_dirs"`
+	FailedEntries []gapJSON      `json:"failed_entries"`
 }
 
 // gapJSON 是一段缺口的序列化形式。
@@ -220,9 +228,10 @@ type excludedJSON struct {
 // JSON 把覆蓋結果序列化成穩定鍵序的 JSON；沒有缺口時仍輸出空陣列。
 func (c Coverage) JSON() (string, error) {
 	encoded := coverageJSON{
-		PartialDirs:  make([]gapJSON, 0, len(c.PartialDirs)),
-		FailedDirs:   make([]gapJSON, 0, len(c.FailedDirs)),
-		ExcludedDirs: make([]excludedJSON, 0, len(c.ExcludedDirs)),
+		PartialDirs:   make([]gapJSON, 0, len(c.PartialDirs)),
+		FailedDirs:    make([]gapJSON, 0, len(c.FailedDirs)),
+		ExcludedDirs:  make([]excludedJSON, 0, len(c.ExcludedDirs)),
+		FailedEntries: make([]gapJSON, 0, len(c.FailedEntries)),
 	}
 	for _, gap := range c.PartialDirs {
 		encoded.PartialDirs = append(encoded.PartialDirs, gapJSON{RelPath: gap.RelPath, Code: string(gap.Code), Detail: gap.Detail})
@@ -232,6 +241,9 @@ func (c Coverage) JSON() (string, error) {
 	}
 	for _, excluded := range c.ExcludedDirs {
 		encoded.ExcludedDirs = append(encoded.ExcludedDirs, excludedJSON{RelPath: excluded.RelPath, Reason: string(excluded.Reason)})
+	}
+	for _, gap := range c.FailedEntries {
+		encoded.FailedEntries = append(encoded.FailedEntries, gapJSON{RelPath: gap.RelPath, Code: string(gap.Code), Detail: gap.Detail})
 	}
 	raw, err := json.Marshal(encoded)
 	if err != nil {
@@ -313,9 +325,16 @@ type walker struct {
 	selfFiles  map[string]struct{}
 	selfDirs   []string
 	batchSize  int
-	tasks      chan task
 	messages   chan message
 	pending    atomic.Int64
+	// 任務佇列刻意不用 channel：channel 滿了會把「生產者」自己擋住，
+	// 而生產者正是唯一能消耗任務的 worker，單一 worker 時會直接自鎖。
+	// 這裡改用互斥鎖 + 條件變數，佇列滿時原地處理，既不阻塞生產者又有界。
+	queueMu    sync.Mutex
+	queueCond  *sync.Cond
+	queue      []task
+	queueLimit int
+	queueDone  bool
 	entryCount atomic.Int64
 	dirOK      atomic.Int64
 	dirPartial atomic.Int64
@@ -351,13 +370,14 @@ func Walk(ctx context.Context, opts Options) (Result, error) {
 	workers := effectiveWorkers(normalized.Workers)
 	depth := effectiveQueueDepth(normalized.QueueDepth, workers)
 	w := &walker{
-		opts:      normalized,
-		root:      root,
-		batchSize: effectiveBatchSize(normalized.BatchSize),
-		tasks:     make(chan task, depth),
-		messages:  make(chan message, depth),
-		cancel:    cancel,
+		opts:       normalized,
+		root:       root,
+		batchSize:  effectiveBatchSize(normalized.BatchSize),
+		messages:   make(chan message, depth),
+		queueLimit: depth,
+		cancel:     cancel,
 	}
+	w.queueCond = sync.NewCond(&w.queueMu)
 	w.selfFiles, w.selfDirs = buildSelfSets(normalized.SelfFiles, normalized.SelfDirs, normalized.CasePolicy)
 	if volume, ok := fsmeta.VolumeOf(root.Info); ok {
 		w.rootVolume = volume
@@ -372,13 +392,14 @@ func Walk(ctx context.Context, opts Options) (Result, error) {
 		}()
 	}
 
-	w.pending.Add(1)
-	select {
-	case w.tasks <- task{relPath: rootRelPath, absPath: root.AbsPath}:
-	case <-walkCtx.Done():
-		// 連根目錄任務都沒送出：仍然要收掉 worker 與 collector。
-		w.pending.Add(-1)
-	}
+	// 取消時喚醒所有在佇列上等待的 worker：條件變數本身不回應 context。
+	go func() {
+		<-walkCtx.Done()
+		w.queueMu.Lock()
+		w.queueCond.Broadcast()
+		w.queueMu.Unlock()
+	}()
+	w.push(walkCtx, task{relPath: rootRelPath, absPath: root.AbsPath})
 	go func() {
 		workersWG.Wait()
 		close(w.messages)
@@ -415,24 +436,47 @@ func Walk(ctx context.Context, opts Options) (Result, error) {
 	return result, nil
 }
 
-// work 是 worker 主迴圈：取任務、列舉、送出批次，並在最後一個任務結束時關閉任務佇列。
+// work 是 worker 主迴圈：取任務、列舉、送出批次，並在最後一個任務結束時收掉佇列。
 func (w *walker) work(ctx context.Context) {
 	for {
-		select {
-		case <-ctx.Done():
+		current, ok := w.take(ctx)
+		if !ok {
 			return
-		case current, ok := <-w.tasks:
-			if !ok {
-				return
-			}
-			w.runTask(ctx, current)
-			if w.pending.Add(-1) == 0 {
-				// pending 為 0 代表沒有任務在執行、也沒有任務正在入列，
-				// 因此此時關閉佇列不會出現「send on closed channel」。
-				close(w.tasks)
-			}
 		}
+		w.runTask(ctx, current)
+		w.finish()
 	}
+}
+
+// take 取出下一個任務；沒有任務且掃描結束（或已取消）時回傳 false。
+func (w *walker) take(ctx context.Context) (task, bool) {
+	w.queueMu.Lock()
+	defer w.queueMu.Unlock()
+	for {
+		if len(w.queue) > 0 {
+			next := w.queue[0]
+			w.queue = w.queue[1:]
+			return next, true
+		}
+		if w.queueDone || ctx.Err() != nil {
+			return task{}, false
+		}
+		w.queueCond.Wait()
+	}
+}
+
+// finish 在一個任務結束後遞減待處理計數，並在歸零時結束整個佇列。
+//
+// 遞減與判斷在同一把鎖內完成：pending 歸零代表沒有任何任務在執行，
+// 因此也不可能還有生產者正在入列，不會遺失任務或重複關閉。
+func (w *walker) finish() {
+	w.queueMu.Lock()
+	remaining := w.pending.Add(-1)
+	if remaining == 0 {
+		w.queueDone = true
+		w.queueCond.Broadcast()
+	}
+	w.queueMu.Unlock()
 }
 
 // runTask 列舉一個目錄並送出其中的條目。
@@ -647,17 +691,33 @@ func (w *walker) entryFor(absPath, relPath string, info fsmeta.Info) model.Entry
 	return entry
 }
 
-// push 把子目錄排入佇列；佇列已滿時阻塞等待，取消時放棄。
+// push 把子目錄排入佇列；佇列已滿時由呼叫端就地把這個任務做完。
+//
+// 關鍵約束：生產者永遠不能被自己擋住。若在這裡阻塞等待空位，
+// 唯一能騰出空位的 worker 正在等的就是它自己，單一 worker 時必定死鎖。
+// 原地處理讓佇列保持有界（記憶體不隨目錄數成長），也不會遺失任何子目錄；
+// 遞迴深度只受目錄層數限制，與檔案數無關。
 func (w *walker) push(ctx context.Context, next task) {
 	if ctx.Err() != nil {
 		return
 	}
-	w.pending.Add(1)
-	select {
-	case w.tasks <- next:
-	case <-ctx.Done():
-		w.pending.Add(-1)
+	w.queueMu.Lock()
+	if w.queueDone {
+		// 佇列已判定結束（代表沒有任何任務在執行，也就不該再有人入列）。
+		w.queueMu.Unlock()
+		return
 	}
+	if len(w.queue) < w.queueLimit {
+		w.queue = append(w.queue, next)
+		w.pending.Add(1)
+		w.queueCond.Signal()
+		w.queueMu.Unlock()
+		return
+	}
+	w.queueMu.Unlock()
+	w.pending.Add(1)
+	w.runTask(ctx, next)
+	w.finish()
 }
 
 // flush 把目前的批次送到 collector；空批次直接丟棄。

@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -404,13 +406,22 @@ func TestWalkRootUnavailable(t *testing.T) {
 // newTestWalker 建立一個只用手動任務驅動的 walker，供白箱測試使用。
 func newTestWalker(t *testing.T) *walker {
 	t.Helper()
-	return &walker{
-		opts:      Options{Root: t.TempDir(), CasePolicy: model.CaseSensitive, RunID: "run-white"},
-		batchSize: 4,
-		tasks:     make(chan task, 8),
-		messages:  make(chan message, 32),
-		cancel:    func() {},
+	w := &walker{
+		opts:       Options{Root: t.TempDir(), CasePolicy: model.CaseSensitive, RunID: "run-white"},
+		batchSize:  4,
+		messages:   make(chan message, 32),
+		queueLimit: 8,
+		cancel:     func() {},
 	}
+	w.queueCond = sync.NewCond(&w.queueMu)
+	return w
+}
+
+// queuedTasks 取出目前排隊中的任務（白箱檢查用）。
+func queuedTasks(w *walker) []task {
+	w.queueMu.Lock()
+	defer w.queueMu.Unlock()
+	return append([]task(nil), w.queue...)
 }
 
 // drainMessages 取出目前所有待處理訊息。
@@ -488,10 +499,8 @@ func TestPushDirOneFileSystem(t *testing.T) {
 	if len(w.coverage.ExcludedDirs) != 1 || w.coverage.ExcludedDirs[0].Reason != ExcludeReasonCrossDevice {
 		t.Fatalf("excluded dirs = %+v", w.coverage.ExcludedDirs)
 	}
-	select {
-	case next := <-w.tasks:
-		t.Fatalf("cross-device directory should not be queued: %+v", next)
-	default:
+	if queued := queuedTasks(w); len(queued) != 0 {
+		t.Fatalf("cross-device directory should not be queued: %+v", queued)
 	}
 
 	sameDevice := int64(1)
@@ -499,13 +508,9 @@ func TestPushDirOneFileSystem(t *testing.T) {
 	if !w.pushDir(context.Background(), "local", filepath.Join(w.opts.Root, "local"), sameInfo) {
 		t.Fatal("a directory on the same device should be queued")
 	}
-	select {
-	case next := <-w.tasks:
-		if next.relPath != "local" {
-			t.Fatalf("queued task = %+v", next)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected a queued task")
+	queued := queuedTasks(w)
+	if len(queued) != 1 || queued[0].relPath != "local" {
+		t.Fatalf("queued tasks = %+v, want one task for local", queued)
 	}
 }
 
@@ -523,7 +528,7 @@ func TestCoverageJSON(t *testing.T) {
 	if !json.Valid([]byte(encoded)) {
 		t.Fatalf("invalid json: %s", encoded)
 	}
-	want := `{"partial_dirs":[{"rel_path":"a","code":"E_SCAN_IO","detail":"boom"}],"failed_dirs":[{"rel_path":"b","code":"E_SCAN_IO"}],"excluded_dirs":[{"rel_path":"c","reason":"pattern"}]}`
+	want := `{"partial_dirs":[{"rel_path":"a","code":"E_SCAN_IO","detail":"boom"}],"failed_dirs":[{"rel_path":"b","code":"E_SCAN_IO"}],"excluded_dirs":[{"rel_path":"c","reason":"pattern"}],"failed_entries":[]}`
 	if encoded != want {
 		t.Fatalf("json = %s, want %s", encoded, want)
 	}
@@ -531,7 +536,7 @@ func TestCoverageJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("empty JSON: %v", err)
 	}
-	if empty != `{"partial_dirs":[],"failed_dirs":[],"excluded_dirs":[]}` {
+	if empty != `{"partial_dirs":[],"failed_dirs":[],"excluded_dirs":[],"failed_entries":[]}` {
 		t.Fatalf("empty json = %s", empty)
 	}
 }
@@ -688,4 +693,54 @@ func sortedKeys(entries map[string]model.Entry) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// TestWalkWideDirectoryDoesNotDeadlock 驗證寬目錄不會讓生產者自鎖。
+//
+// 迴歸來源：任務佇列原本是無緩衝邏輯的 channel，佇列一滿就把 worker 自己擋住，
+// 而 worker 正是唯一能騰出空位的一方。單一 worker 遇到超過佇列深度的同層子目錄
+// 就會永久卡住，且不會有任何錯誤訊息。
+func TestWalkWideDirectoryDoesNotDeadlock(t *testing.T) {
+	root := t.TempDir()
+	const dirCount = 24
+	for index := 0; index < dirCount; index++ {
+		sub := filepath.Join(root, "d"+strconv.Itoa(index))
+		mustMkdir(t, sub)
+		mustWrite(t, filepath.Join(sub, "f.txt"), "payload")
+	}
+	mustWrite(t, filepath.Join(root, "top.txt"), "top")
+
+	type outcome struct {
+		result Result
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		var entries int64
+		result, err := Walk(context.Background(), Options{
+			Root:       root,
+			CasePolicy: model.CaseSensitive,
+			RunID:      "run-wide",
+			Workers:    1,
+			BatchSize:  4,
+			Sink: func(_ context.Context, batch []model.Entry) error {
+				entries += int64(len(batch))
+				return nil
+			},
+		})
+		_ = entries
+		done <- outcome{result: result, err: err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("walk: %v", got.err)
+		}
+		// 根目錄 + 24 個子目錄，加上每個子目錄裡的一個檔案與根目錄的檔案。
+		if want := int64(dirCount*2 + 2); got.result.Entries != want {
+			t.Fatalf("entries = %d, want %d", got.result.Entries, want)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Walk did not finish within 30s: the task queue deadlocked")
+	}
 }

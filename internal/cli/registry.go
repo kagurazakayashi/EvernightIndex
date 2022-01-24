@@ -100,10 +100,10 @@ var flagRegistry = []flagSpec{
 	{name: "run", short: 'u', typ: typeString, def: "", value: "<run-id>", descKey: "flag.run.desc", commands: []string{"export-log", "recover"}},
 }
 
-// commandRegistry 是全部子命令。本步驟所有業務命令都尚未實作，
-// 只提供解析、預設值、互斥檢查與說明，執行時明確回報尚未實作。
+// commandRegistry 是全部子命令。index 與 info 已實作；其餘命令仍只提供解析、
+// 預設值、互斥檢查與說明，執行時明確回報尚未實作。
 var commandRegistry = []commandSpec{
-	{name: "index", argSpec: "<dir>", argMin: 1, argMax: 1, summaryKey: "cmd.index.summary", implemented: false},
+	{name: "index", argSpec: "<dir>", argMin: 1, argMax: 1, summaryKey: "cmd.index.summary", implemented: true},
 	{name: "find", argSpec: "", argMin: 0, argMax: 0, summaryKey: "cmd.find.summary", implemented: false},
 	{name: "dupes", argSpec: "<dir-a> <dir-b>", argMin: 2, argMax: 2, summaryKey: "cmd.dupes.summary", implemented: false},
 	{name: "info", argSpec: "", argMin: 0, argMax: 0, summaryKey: "cmd.info.summary", implemented: true},

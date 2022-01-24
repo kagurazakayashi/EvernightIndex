@@ -146,7 +146,6 @@ func TestNotImplementedCommandsFailLoudly(t *testing.T) {
 	withSystemLanguage(t, "")
 	dir := t.TempDir()
 	cases := [][]string{
-		{"index", dir},
 		{"find"},
 		{"dupes", dir, dir},
 		{"export-log"},
@@ -370,4 +369,72 @@ func firstLines(text string, count int) string {
 		lines = lines[:count]
 	}
 	return strings.Join(lines, " | ")
+}
+
+// TestIndexCommandEndToEnd 驗證 index 從參數解析一路走到發佈。
+//
+// 這是唯一會實際建立資料庫的命令路徑：stdout 必須保持乾淨，
+// 診斷與統計走 stderr，重跑時明確拒絕而不是覆蓋。
+func TestIndexCommandEndToEnd(t *testing.T) {
+	withSystemLanguage(t, "")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	first := runCLI(t, []string{"-l", "en-US", "index", dir}, nil)
+	if first.code != 0 {
+		t.Fatalf("index exit code = %d, want 0 (stderr %q)", first.code, first.stderr)
+	}
+	if first.stdout != "" {
+		t.Errorf("index must not write to stdout: %q", first.stdout)
+	}
+	for _, want := range []string{"SHA256 enabled", "Published generation 1"} {
+		if !strings.Contains(first.stderr, want) {
+			t.Errorf("stderr is missing %q: %q", want, first.stderr)
+		}
+	}
+	dbPath := filepath.Join(dir, "index.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("database was not created: %v", err)
+	}
+
+	// info 必須能讀到這次建立的索引。
+	info := runCLI(t, []string{"-l", "en-US", "info", "--db", dbPath}, nil)
+	if info.code != 0 {
+		t.Fatalf("info exit code = %d (stderr %q)", info.code, info.stderr)
+	}
+	for _, want := range []string{"generation: 1", "index_state: complete", "entries: 2"} {
+		if !strings.Contains(info.stdout, want) {
+			t.Errorf("info output is missing %q: %q", want, info.stdout)
+		}
+	}
+
+	second := runCLI(t, []string{"-l", "en-US", "index", dir}, nil)
+	if second.code != 1 {
+		t.Fatalf("second index exit code = %d, want 1", second.code)
+	}
+	if !strings.Contains(second.stderr, "E_UPDATE_NOT_SUPPORTED") {
+		t.Errorf("second run must explain that updates are not implemented: %q", second.stderr)
+	}
+}
+
+// TestIndexRejectsUnimplementedOptionsEndToEnd 驗證未實作選項的 CLI 退出碼。
+func TestIndexRejectsUnimplementedOptionsEndToEnd(t *testing.T) {
+	withSystemLanguage(t, "")
+	dir := t.TempDir()
+	cases := [][]string{
+		{"index", dir, "--change-log"},
+		{"index", dir, "--temp-dir", t.TempDir()},
+	}
+	for _, argv := range cases {
+		result := runCLI(t, argv, nil)
+		if result.code != 1 {
+			t.Errorf("%v: exit code = %d, want 1", argv, result.code)
+		}
+		if !strings.Contains(result.stderr, "E_NOT_IMPLEMENTED") {
+			t.Errorf("%v: stderr is missing E_NOT_IMPLEMENTED: %q", argv, result.stderr)
+		}
+	}
+	requireEmptyDir(t, dir)
 }

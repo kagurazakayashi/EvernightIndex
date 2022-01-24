@@ -24,6 +24,12 @@ import (
 //     期間被其他結果覆蓋就拒絕發佈，不覆蓋他人結果；
 //   - 提交後才收到的取消不會改寫執行狀態，也不回報「已回滾」。
 
+// abandonTimeout 是未發佈收尾的最長寫入時間。
+//
+// 它只包住「記錄收尾狀態」這一個交易，不包住掃描或發佈；
+// 使用者取消後仍必須留下可解釋的執行狀態。
+const abandonTimeout = 10 * time.Second
+
 // sqliteBusyTimeout 是 SQLite 自身的等待上限。
 //
 // 跨行程互斥由正式目標鎖負責；這裡只是避免短暫的內部競爭直接失敗。
@@ -239,6 +245,16 @@ func (r *Run) Stage(ctx context.Context, entries []model.Entry) error {
 	return r.storage.StageEntries(ctx, r.id, entries)
 }
 
+// Observe 輸出一筆逐條操作記錄（只有 --verbose 才會真的寫入）。
+//
+// 索引層用它回報每個條目的終態；它不改變任何狀態，也不參與統計。
+func (r *Run) Observe(kind model.OpKind, relPath string) {
+	if r == nil {
+		return
+	}
+	r.reporter.operation(kind, relPath)
+}
+
 // StageDeletions 暫存一批待刪除路徑；實際刪除只發生在發佈交易內。
 func (r *Run) StageDeletions(ctx context.Context, pathKeys []string) error {
 	if r == nil || r.storage == nil {
@@ -405,7 +421,11 @@ func (r *Run) Abandon(ctx context.Context, cause AbandonCause) error {
 	if cause.Err != nil {
 		errorCode = errorCodeOf(cause.Err)
 	}
-	err := r.storage.FinishRun(ctx, store.FinishSpec{
+	// 收尾狀態必須寫得進去：造成中止的取消不該讓「已中斷／已失敗」這筆紀錄失敗，
+	// 否則資料庫會留下一個永遠是 running 的執行列。
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), abandonTimeout)
+	defer cancelCleanup()
+	err := r.storage.FinishRun(cleanupCtx, store.FinishSpec{
 		RunID:        r.id,
 		Status:       status,
 		Coverage:     coverage,

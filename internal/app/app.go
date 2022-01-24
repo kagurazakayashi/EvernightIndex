@@ -65,6 +65,8 @@ func (s *Service) Run(ctx context.Context, request Request) error {
 		return model.Wrap(model.CodeInterrupted, "err.interrupted", model.ExitInterrupted, nil, err)
 	}
 	switch request.Command {
+	case "index":
+		return s.runIndex(ctx, request)
 	case "info":
 		return s.runInfo(ctx, request)
 	default:

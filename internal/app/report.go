@@ -94,14 +94,18 @@ func (r *reporter) text(key string, args map[string]string) string {
 // 數值一律用十進位整數字串，不隨語言改變，避免腳本解析失敗。
 func statsArgs(snapshot output.Snapshot) map[string]string {
 	return map[string]string{
-		"discovered": strconv.FormatInt(snapshot.Discovered, 10),
-		"processed":  strconv.FormatInt(snapshot.Processed, 10),
-		"succeeded":  strconv.FormatInt(snapshot.Succeeded, 10),
-		"failed":     strconv.FormatInt(snapshot.Failed, 10),
-		"errors":     strconv.FormatInt(snapshot.Errors, 10),
-		"published":  strconv.FormatInt(snapshot.Published, 10),
-		"bytes":      strconv.FormatInt(snapshot.BytesRead, 10),
-		"elapsed":    formatElapsed(snapshot.Elapsed),
+		"discovered":  strconv.FormatInt(snapshot.Discovered, 10),
+		"processed":   strconv.FormatInt(snapshot.Processed, 10),
+		"succeeded":   strconv.FormatInt(snapshot.Succeeded, 10),
+		"failed":      strconv.FormatInt(snapshot.Failed, 10),
+		"files":       strconv.FormatInt(snapshot.Files, 10),
+		"dirs":        strconv.FormatInt(snapshot.Dirs, 10),
+		"hashes":      strconv.FormatInt(snapshot.HashComputed, 10),
+		"hash_failed": strconv.FormatInt(snapshot.HashFailed, 10),
+		"errors":      strconv.FormatInt(snapshot.Errors, 10),
+		"published":   strconv.FormatInt(snapshot.Published, 10),
+		"bytes":       strconv.FormatInt(snapshot.BytesRead, 10),
+		"elapsed":     formatElapsed(snapshot.Elapsed),
 	}
 }
 

@@ -8,10 +8,10 @@ This file is the English master; the other three editions mirror its structure a
 
 ## Status
 
-- Version `0.1.0-dev` (project skeleton plus the storage and run-control layer). The command contract, the four message catalogs, the SQLite foundation, schema version 2, staging and publish generations, the cross-process write lock, the run lifecycle and the per-second statistics are in place.
+- Version `0.1.0-dev` (project skeleton, storage and run-control layer, scanner and streamed SHA256). The command contract, the four message catalogs, the SQLite foundation, schema version 2, staging and publish generations, the cross-process write lock, the run lifecycle, the streaming digest module and the per-second statistics are in place.
 - `info` is implemented as a read-only command: it reports the format version, database UUID, bound root, published generation, entry and digest coverage, the latest run and pending change-log exports. It never creates, migrates or locks a database.
-- The traversal and metadata modules (`internal/scan`, `internal/fsmeta`) and the shared pattern matcher (`internal/match`) are implemented and covered by real tests on Windows; no command calls them yet, so no CLI path scans a tree. See "Scanning and metadata" below for the exact behavior.
-- Every other business command (`index`, `find`, `dupes`, `export-log`, `recover`) parses and validates its options, then exits with code `1` and an `E_NOT_IMPLEMENTED` message. Wiring the scanner to `index`, SHA256 hashing, change-log CSV export, queries, duplicate detection, temporary working copies and recovery are **not implemented yet**; the sections below describe the fixed contract and do not claim working features.
+- The traversal, metadata and pattern modules (`internal/scan`, `internal/fsmeta`, `internal/match`) and the digest module (`internal/hash`) are implemented and covered by real tests on Windows, and `index` now drives them end to end. See "Scanning and metadata" below for the exact behavior.
+- `index` creates a brand-new index: it resolves the root and `--db`, walks the tree, streams entries into the staging table, computes SHA256 unless told otherwise, then publishes in one transaction. An existing published index is refused with `E_UPDATE_NOT_SUPPORTED` because incremental update is the next step. Change-log CSV export, queries, duplicate detection, temporary working copies and recovery remain **not implemented yet**.
 
 ## Requirements
 
@@ -54,16 +54,17 @@ evernightindex --help
 evernightindex index --help
 evernightindex --lang zh-CN --help
 evernightindex index /data --help
+evernightindex index /data
 evernightindex info --db /data/index.db
 ```
 
-In `cmd` use double quotes around paths with spaces (`--db "C:\\my data\\index.db"`); in PowerShell single quotes are often simpler. `info` opens an existing database read-only: without `--db` it exits with code `2`, and a missing, foreign, corrupt, newer or incomplete database is refused with a stable error code instead of being modified. Running `index /data` without `--help` still fails with code `1` and touches nothing.
+In `cmd` use double quotes around paths with spaces (`--db "C:\\my data\\index.db"`); in PowerShell single quotes are often simpler. `info` opens an existing database read-only: without `--db` it exits with code `2`, and a missing, foreign, corrupt, newer or incomplete database is refused with a stable error code instead of being modified. `index /data` creates `<root>/index.db` with SHA256 digests and exits with `0`; running it again refuses to rebuild that index (`E_UPDATE_NOT_SUPPORTED`).
 
 ## Commands
 
 | Command | Arguments | Status | Purpose |
 | --- | --- | --- | --- |
-| `index` | `<dir>` | not implemented | Create or update the index of one directory |
+| `index` | `<dir>` | implemented (creation only) | Create the index of one directory |
 | `find` | none | not implemented | Query indexed entries by name, path or typed filter |
 | `dupes` | `<dir-a> <dir-b>` | not implemented | Compare two indexed directories for duplicate regular files |
 | `info` | none | implemented (read-only) | Show bound root, format version, run status and digest coverage |
@@ -145,6 +146,25 @@ An invalid explicit value is an error (`E_INVALID_LANGUAGE`) and is never silent
 - During a run, statistics go to stderr once per second; a run that finishes in less than a second still prints a final summary, so processed, failed, error-event and published counts are always visible. Statistics keep discovered, processed, succeeded, failed, error events and published entries apart: processed does not mean saved, and a cancelled or rolled-back run keeps `published` at zero.
 - `--quiet` disables the regular progress **and** the final summary (errors are never suppressed), `--verbose` adds one line per processed path, and `--progress=false` disables only the per-second ticks while keeping the final summary. `--quiet` together with `--verbose` is rejected.
 
+## Creating an index
+
+```sh
+evernightindex index /data                 # create /data/index.db with SHA256
+evernightindex index /data --sha256=false  # metadata only, file content is never opened
+evernightindex index /data --db /backup/index.db --deep
+```
+
+- This step creates indexes; it does not update them. The database is created when it does not exist, and without `--db` the target is `<root>/index.db`; an explicit relative `--db` is resolved against the calling working directory. A database that already holds a published generation is refused with `E_UPDATE_NOT_SUPPORTED` and is neither rebuilt nor overwritten. A database left unpublished by an interrupted first run may be created again, because it holds no published result.
+- Every option is checked before anything is scanned or written. `--deep` with `--sha256=false` is rejected with exit code `2`; `--change-log` and `--temp-dir` are refused with `E_NOT_IMPLEMENTED` instead of being silently ignored, because change logs and temporary working copies are later steps.
+- The root is resolved and validated before the database is created, so an unavailable root (`E_ROOT_UNAVAILABLE`) never produces an empty index.
+- Digest states: a regular file stored with `--sha256=true` gets a streamed SHA256 (`computed`); with `--sha256=false` it is recorded as `disabled` and no file is opened at all; directories, symlinks and special files are `not_applicable` and never carry a digest. An empty file gets the standard SHA256 of empty input. A file whose content cannot be read, or that keeps changing while it is read, is recorded as `failed` with an `error_code` and `error_stage`, with no digest at all, and it appears in the coverage gaps.
+- Each read opens the file once and checks the same handle before and after reading (identity, size, modification time) plus the values recorded by the scan; a mismatch is retried `--read-retries` times (default 1) and then recorded as a failure. This catches a path that was replaced after the scan and a file modified while it was read; it cannot rule out every concurrent writer (for example a write that bypasses the file system interface, or a change that also restores the timestamps).
+- Content is read through a fixed 128 KiB buffer per worker with one bounded batch in flight, and entries are staged batch by batch, so memory does not grow with the file size or the tree size. `--workers` bounds the digest workers (`1..max(1, logical CPUs / 2)`, default 1).
+- The run records the root (absolute path, case policy, volume and file identity), the scan parameters, entry metadata, digest state, coverage gaps and the run counters. Statistics cover discovered, processed, succeeded, failed, files, directories, digests, bytes read and the published count, and `--verbose` adds one line per entry and per digest.
+- Partial results are published on purpose: an unreadable subdirectory or a failed digest yields `coverage = partial` with the failing paths recorded in `coverage_json` and exit code `3`, so a successful area stays usable while the gap stays visible. An explicit `--exclude` is recorded in the coverage list as well, but it does not turn the run into a partial failure.
+- Interruption: the first Ctrl+C stops new work, discards the staged result, keeps the previous generation (or leaves a clearly unpublished database after a first creation) and exits with `130`. A cancel that arrives after the commit does not rewrite the status; it is reported as "cancel after commit" and never as a rollback.
+- The database itself, its `-journal`/`-wal`/`-shm` companions and its lock file are excluded even when they appear while the scan is running. The change-log directory will be excluded once change logs exist.
+
 ## Database foundation
 
 - Driver: `modernc.org/sqlite v1.62.0`, pure Go, no CGO. It was chosen after verifying transactions, cancellation, consistent backup and cross-compilation, not for the "pure Go" label alone.
@@ -169,11 +189,11 @@ Verified on Windows amd64 by real execution (`go test ./internal/store ./interna
 | macOS arm64 and amd64 | cross-compiled | no | `CGO_ENABLED=0` cross build only; `defaults` locale detection is untested |
 | Linux amd64 | cross-compiled | no | `CGO_ENABLED=0` cross build only; tests were not executed on Linux |
 
-Cross-compiling is not runtime verification. The scanner and the metadata collector are verified by real tests on Windows; the macOS and Linux implementations are compiled and their test binaries compile for those targets, but they were not executed there.
+Cross-compiling is not runtime verification. The scanner, the metadata collector and the digest module are verified by real tests on Windows; the macOS and Linux implementations are compiled and their test binaries compile for those targets, but they were not executed there.
 
 ## Scanning and metadata
 
-The traversal and metadata modules are in place and tested, but the `index` command is not wired to them yet, so nothing below is reachable from the CLI in this build.
+The traversal, metadata and pattern modules are in place, tested, and drive `index`; this section describes their behavior.
 
 - Paths come from exactly one place. Every explicit relative path (database, log directory, temporary directory, root) is resolved against the working directory captured when the process starts, never against the process working directory later and never against the scan root or a temporary directory. The root is made absolute and its symlinks are resolved once, so the same directory always yields the same relative paths.
 - Traversal records the root itself, hidden entries, empty directories and every accessible descendant. A directory whose modification time did not change is still descended: a stable mtime is not proof that a subtree is unchanged.
@@ -195,7 +215,7 @@ The traversal and metadata modules are in place and tested, but the `index` comm
 
 ## Not implemented yet
 
-The scanning, metadata and pattern modules are implemented and tested, but the `index` command is not wired to them yet. Still missing: streamed SHA256 with read-stability checks; index creation and fast/deep update with conservative deletion rules; change-log CSV export and retry; typed filters, field selection and JSONL/CSV/NUL output; duplicate detection with `auto`/`metadata`/`sha256` plus on-demand verification; temporary working copies with publish and recovery. `info` is implemented, and the statistics, run lifecycle, staging and publish boundary and write lock are in place.
+`index` now creates a complete first index, and `info`, the statistics, the run lifecycle, the staging/publish boundary and the write lock are in place. Still missing: incremental and detailed update with digest reuse and conservative deletion rules (an existing index is refused for now), change-log CSV export and retry, typed filters, field selection and JSONL/CSV/NUL output, duplicate detection with `auto`/`metadata`/`sha256` plus on-demand verification, and temporary working copies with publish and recovery.
 
 ## Project layout
 
@@ -207,6 +227,8 @@ internal/model          domain types, stable error codes and exit codes
 internal/store          SQLite schema and migration, staging and publish, write lock, backup
 internal/fsmeta         per-OS metadata collection, identity comparison, case-policy probe
 internal/scan           traversal, exclusions, one-file-system scope, coverage events
+internal/hash           streamed SHA256, stability checks before and after reading, bounded workers
+internal/index          scan-to-stage conversion, digest decision, coverage gaps
 internal/match          shared name/path wildcard matcher
 internal/platform       per-OS facts (system locale) behind build tags
 internal/output         stdout/stderr separation, verbosity, thread-safe statistics, per-second ticks
