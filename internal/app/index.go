@@ -19,11 +19,13 @@ import (
 )
 
 // 本檔是 index 命令的編排層：解析根目錄與資料庫位置、在寫入前拒絕尚未實作的
-// 選項與既存索引，然後依「開啟執行 → 建索引 → 發佈或放棄」的固定順序完成工作。
+// 選項、預檢既有資料庫的格式/根目錄身份/上次發佈狀態，然後依
+// 「開啟執行 → 建索引（首次建立或增量更新）→ 發佈或放棄」的固定順序完成工作。
 //
 // 邊界：
 //   - 所有拒絕都發生在任何掃描、檔案內容讀取與資料庫變更之前；
-//   - 只支援首次建立；已含已發佈代次的資料庫一律拒絕，不重建也不覆蓋；
+//   - 同一個命令兩種模式：資料庫沒有已發佈代次時建立，有代次時更新；
+//     兩者共用同一條暫存/發佈管線，提交成功前已發佈視圖完全不變；
 //   - 發佈是唯一提交點，取消或失敗都不會留下半次更新。
 
 // indexTarget 把一次執行包成索引層的寫入目標。
@@ -42,9 +44,24 @@ func (t indexTarget) Stage(ctx context.Context, entries []model.Entry) error {
 	return t.run.Stage(ctx, entries)
 }
 
+// StageDeletions 暫存一批待刪除路徑。
+func (t indexTarget) StageDeletions(ctx context.Context, pathKeys []string) error {
+	return t.run.StageDeletions(ctx, pathKeys)
+}
+
+// Lookup 取回與本次掃描路徑相同的已發佈條目。
+func (t indexTarget) Lookup(ctx context.Context, pathKeys []string) (map[string]model.Entry, error) {
+	return t.run.Storage().LookupPublished(ctx, t.run.Root().ID, pathKeys)
+}
+
+// Unseen 串流列出本次沒有再出現的已發佈條目。
+func (t indexTarget) Unseen(ctx context.Context, visit func(model.Entry) error) error {
+	return t.run.Storage().EachUnseenPublished(ctx, t.run.Root().ID, t.run.ID(), visit)
+}
+
 // runIndex 執行 index 命令，並把「取消造成的錯誤」統一成使用者中斷。
 //
-// 回傳的錯誤決定退出碼：參數問題 2、既存索引或資料庫問題 1、部分完成 3、中斷 130。
+// 回傳的錯誤決定退出碼：參數問題 2、資料庫或根目錄問題 1、部分完成 3、中斷 130。
 func (s *Service) runIndex(ctx context.Context, request Request) error {
 	err := s.runIndexOnce(ctx, request)
 	if err == nil || model.ExitCodeOf(err) == model.ExitInterrupted {
@@ -99,22 +116,17 @@ func (s *Service) runIndexOnce(ctx context.Context, request Request) error {
 	}
 	volume, fileID, err := fsmeta.RootIdentity(root.AbsPath)
 	if err != nil {
+		// 身份採集失敗同樣在任何寫入之前結束：不明身分的根目錄不能拿來更新既有索引。
 		return err
 	}
 	dbPath, err := resolveDBPath(callCWD, options.DB, root.AbsPath)
 	if err != nil {
 		return err
 	}
-	generation, exists, err := existingPublishedGeneration(ctx, dbPath)
+	// 預檢：格式/版本、根目錄身份與上次發佈狀態。唯讀開啟，不建立、不遷移、不上鎖。
+	inspection, err := inspectDatabase(ctx, dbPath, root.AbsPath, volume)
 	if err != nil {
 		return err
-	}
-	if exists {
-		// 增量更新尚未實作：不重建、不覆蓋，明確說明原因與目前代次。
-		return model.New(model.CodeUpdateNotSupported, "err.updateNotSupported", model.ExitFatal, map[string]string{
-			"generation": strconv.FormatInt(generation, 10),
-			"path":       dbPath,
-		})
 	}
 	excludes, err := compileExcludes(options.Excludes, casePolicy)
 	if err != nil {
@@ -146,23 +158,16 @@ func (s *Service) runIndexOnce(ctx context.Context, request Request) error {
 	}
 	defer func() { _ = run.Close() }()
 
-	// 種族防線：另一個行程可能剛好在檢查與取鎖之間發布了首個代次。
-	// 這時本次執行已經建立執行紀錄，仍必須拒絕覆蓋，並以未發佈狀態收尾。
-	if baseline := run.Baseline(); baseline > 0 {
-		cause := AbandonCause{
-			Err: model.New(model.CodeUpdateNotSupported, "err.updateNotSupported", model.ExitFatal, map[string]string{
-				"generation": strconv.FormatInt(baseline, 10),
-				"path":       dbPath,
-			}),
-			Coverage: model.CoverageUnknown,
-		}
-		_ = run.Abandon(ctx, cause)
-		return cause.Err
+	if inspection.Exists && inspection.Generation == 0 {
+		// 既有資料庫沒有已發佈代次（上次建立被取消或發佈失敗）：
+		// 重跑等同重新建立，不覆蓋任何已發佈結果，但要說清楚為什麼。
+		s.note("report.reusingIncomplete", map[string]string{"path": inspection.Path})
 	}
-
-	s.note(planKey(options.SHA256), map[string]string{
+	s.note(planMessageKey(run.Mode(), options), map[string]string{
 		"root":         root.AbsPath,
 		"database":     dbPath,
+		"generation":   strconv.FormatInt(run.Baseline(), 10),
+		"next":         strconv.FormatInt(run.Baseline()+1, 10),
 		"workers":      strconv.Itoa(hashWorkers(options.Workers)),
 		"read_retries": strconv.Itoa(effectiveRetries(options.ReadRetries)),
 	})
@@ -172,6 +177,7 @@ func (s *Service) runIndexOnce(ctx context.Context, request Request) error {
 		CasePolicy:    casePolicy,
 		SHA256:        options.SHA256,
 		Deep:          options.Deep,
+		ChangeLog:     options.ChangeLog,
 		OneFileSystem: options.OneFileSystem,
 		Workers:       options.Workers,
 		ReadRetries:   options.ReadRetries,
@@ -205,11 +211,17 @@ func (s *Service) runIndexOnce(ctx context.Context, request Request) error {
 		stats.AddFailed(result.HashFailed)
 	}
 
-	published, err := run.Publish(ctx, Publication{
+	publication := Publication{
 		Coverage:     result.Coverage,
 		CoverageJSON: result.CoverageJSON,
 		MessageKey:   "report.published",
-	})
+	}
+	// 變化事件與索引同交易提交；變化日誌關閉時不保留完整歷史，只留執行摘要計數。
+	if options.ChangeLog {
+		publication.Events = result.Events
+		publication.RecordExport = true
+	}
+	published, err := run.Publish(ctx, publication)
 	if err != nil {
 		interrupted := index.IsCanceled(ctx, err)
 		_ = run.Abandon(ctx, AbandonCause{
@@ -225,7 +237,38 @@ func (s *Service) runIndexOnce(ctx context.Context, request Request) error {
 		}
 		return err
 	}
+	s.reportChanges(run.Mode(), options, result)
 	return published.ExitError()
+}
+
+// reportChanges 輸出這次更新的變化摘要與必要的限制說明。
+//
+// 統計行說的是「處理了多少」，這裡說的是「變了什麼」，兩者刻意分開：
+// 快速模式沒有讀取每個檔案的內容，因此不能讓使用者以為所有變化都被發現了。
+func (s *Service) reportChanges(mode model.RunMode, options Options, result index.Result) {
+	if mode == model.RunModeUpdate {
+		s.note("report.changeSummary", map[string]string{
+			"added":      strconv.FormatInt(result.Added, 10),
+			"updated":    strconv.FormatInt(result.Updated, 10),
+			"removed":    strconv.FormatInt(result.Removed, 10),
+			"excluded":   strconv.FormatInt(result.Excluded, 10),
+			"unverified": strconv.FormatInt(result.Unverified, 10),
+			"unchanged":  strconv.FormatInt(result.Unchanged, 10),
+		})
+	}
+	if result.HashReused > 0 {
+		s.note("report.hashReused", map[string]string{
+			"count": strconv.FormatInt(result.HashReused, 10),
+		})
+	}
+	if result.Unverified > 0 {
+		s.note("report.unverifiedKept", map[string]string{
+			"count": strconv.FormatInt(result.Unverified, 10),
+		})
+	}
+	if options.SHA256 && !options.Deep && mode == model.RunModeUpdate {
+		s.note("report.quickModeCaveat", nil)
+	}
 }
 
 // interruptedError 把取消包成使用者中斷（退出碼 130）。
@@ -241,12 +284,89 @@ func (s *Service) note(key string, args map[string]string) {
 	s.deps.Console.Note("%s", s.deps.Catalog.T(s.deps.Lang, key, args))
 }
 
-// planKey 依 SHA256 選項選擇開場訊息：內容是否會被讀取必須在開始前說清楚。
-func planKey(sha256Enabled bool) string {
-	if sha256Enabled {
-		return "report.planSha256"
+// planMessageKey 依模式與選項選擇開場訊息。
+//
+// 內容是否會被讀取必須在開始前說清楚：快速模式只讀取必要檔案，
+// 細緻模式一定重算全部摘要，關閉保存時則完全不開啟檔案內容。
+func planMessageKey(mode model.RunMode, options Options) string {
+	if mode == model.RunModeUpdate {
+		switch {
+		case options.Deep:
+			return "report.planUpdateDeep"
+		case options.SHA256:
+			return "report.planUpdateSha256"
+		default:
+			return "report.planUpdateNoSha256"
+		}
 	}
-	return "report.planNoSha256"
+	if options.SHA256 {
+		return "report.planCreateSha256"
+	}
+	return "report.planCreateNoSha256"
+}
+
+// inspection 是既有資料庫的預檢結果。
+//
+// Generation 為 0 表示資料庫存在但尚未發佈任何代次（上一次建立被取消或發佈失敗），
+// 這種資料庫沒有任何已發佈結果，重跑等同重新建立。
+type inspection struct {
+	Exists     bool
+	Path       string
+	Generation int64
+}
+
+// inspectDatabase 以唯讀方式檢查目標資料庫的格式、根目錄身份與上次發佈狀態。
+//
+// 用唯讀連線的理由與 info 相同：檢查本身不得建立資料庫、不得遷移結構、
+// 也不得取得寫入鎖。路徑或卷身份不一致時直接拒絕，絕不自動改綁。
+func inspectDatabase(ctx context.Context, dbPath, rootPath string, volume *string) (inspection, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return inspection{Path: dbPath}, nil
+		}
+		return inspection{}, model.Wrap(model.CodeDatabaseIO, "err.databaseIO", model.ExitFatal,
+			map[string]string{"detail": err.Error()}, err)
+	}
+	storage, err := store.Open(ctx, dbPath, store.Options{ReadOnly: true})
+	if err != nil {
+		return inspection{}, err
+	}
+	defer func() { _ = storage.Close() }()
+	result := inspection{Exists: true, Path: dbPath}
+	bound, hasRoot, err := storage.Root(ctx)
+	if err != nil {
+		return inspection{}, err
+	}
+	if !hasRoot {
+		// 綁定尚未完成：沒有任何已發佈結果，等同首次建立。
+		return result, nil
+	}
+	// 大小寫策略沿用資料庫記錄的來源環境策略，不用目前系統的假設覆蓋它。
+	if model.PathKey(rootPath, bound.CasePolicy) != bound.PathKey {
+		return inspection{}, rootMismatch(bound.AbsPath, rootPath)
+	}
+	if bound.VolumeIdentity != nil && volume != nil && *bound.VolumeIdentity != *volume {
+		// 同一個路徑換了卷（例如磁碟代號被重新掛載到別的媒體）：
+		// 這不是「檔案被刪光」，而是根目錄被換掉，必須拒絕而不是清空舊記錄。
+		return inspection{}, rootMismatch(
+			bound.AbsPath+" (volume "+*bound.VolumeIdentity+")",
+			rootPath+" (volume "+*volume+")",
+		)
+	}
+	generation, err := storage.PublishedGeneration(ctx)
+	if err != nil {
+		return inspection{}, err
+	}
+	result.Generation = generation
+	return result, nil
+}
+
+// rootMismatch 建立根目錄不一致的錯誤。
+func rootMismatch(expected, found string) error {
+	return model.New(model.CodeRootMismatch, "err.rootMismatch", model.ExitFatal, map[string]string{
+		"expected": expected,
+		"found":    found,
+	})
 }
 
 // resolveDBPath 決定資料庫路徑：未指定時使用掃描根目錄內的 index.db。
@@ -260,33 +380,6 @@ func resolveDBPath(callCWD, requested, rootPath string) (string, error) {
 
 // defaultDatabaseName 是預設的資料庫檔名。
 const defaultDatabaseName = "index.db"
-
-// existingPublishedGeneration 檢查目標是否已是含已發佈代次的索引。
-//
-// 用唯讀連線詢問，確保檢查本身不會建立資料庫、不會遷移結構，也不會取得寫入鎖。
-// 檔案不存在時回報 (0, false, nil)；存在但不是本程式資料庫時直接回報錯誤。
-func existingPublishedGeneration(ctx context.Context, dbPath string) (int64, bool, error) {
-	if _, err := os.Stat(dbPath); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return 0, false, nil
-		}
-		return 0, false, model.Wrap(model.CodeDatabaseIO, "err.databaseIO", model.ExitFatal,
-			map[string]string{"detail": err.Error()}, err)
-	}
-	storage, err := store.Open(ctx, dbPath, store.Options{ReadOnly: true})
-	if err != nil {
-		return 0, false, err
-	}
-	defer func() { _ = storage.Close() }()
-	generation, err := storage.PublishedGeneration(ctx)
-	if err != nil {
-		return 0, false, err
-	}
-	if generation > 0 {
-		return generation, true, nil
-	}
-	return 0, false, nil
-}
 
 // compileExcludes 把排除模式編譯成共用集合，大小寫策略與掃描一致。
 func compileExcludes(patterns []string, policy model.CasePolicy) (*match.Set, error) {

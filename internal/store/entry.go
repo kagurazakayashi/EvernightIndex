@@ -524,14 +524,8 @@ func (s *Store) PublishedEntry(ctx context.Context, rootID int64, pathKey string
 
 // scanEntry 以共用的欄位定義掃描一筆條目。
 func (s *Store) scanEntry(ctx context.Context, rootID int64, pathKey string, entry *model.Entry) error {
-	names := make([]string, len(entryColumns))
-	destinations := make([]any, len(entryColumns))
-	for index, column := range entryColumns {
-		names[index] = column.name
-		destinations[index] = column.field(entry)
-	}
-	query := "SELECT " + strings.Join(names, ", ") + " FROM entry WHERE root_id = ? AND path_key = ?"
-	if err := s.db.QueryRowContext(ctx, query, rootID, pathKey).Scan(destinations...); err != nil {
+	query := "SELECT " + strings.Join(entryColumnNames(), ", ") + " FROM entry WHERE root_id = ? AND path_key = ?"
+	if err := s.db.QueryRowContext(ctx, query, rootID, pathKey).Scan(entryScanDestinations(entry)...); err != nil {
 		return databaseError(err)
 	}
 	return nil

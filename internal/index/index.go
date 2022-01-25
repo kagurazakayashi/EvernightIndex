@@ -1,17 +1,20 @@
 // Package index 把掃描結果轉成可發佈的索引內容。
 //
-// 本步驟只做「首次建立」：資料庫還沒有已發佈代次時，把整棵目錄樹寫進暫存區，
-// 依 SHA256 選項決定要不要讀取檔案內容，最後由呼叫端在交易內發佈。
-// 增量更新（快速判據比對、摘要重用、保守刪除判定）不在本步驟範圍內，
-// 相關入口刻意留白，不提供半套實作。
+// 本套件同時支援首次建立與增量更新，兩者共用同一條管線：
+//
+//	掃描批次 → 取回同路徑的已發佈條目 → 逐條決策（摘要計算/複用/清除）
+//	        → 變化分類 → 暫存 → 掃描結束後保守判定消失條目 → 由呼叫端發佈
 //
 // 契約：
 //  1. 掃描結果以批次流式處理：一批進、一批暫存，不在記憶體裡累積整棵樹；
-//  2. 關閉 SHA256 時完全不開啟檔案內容，條目留下 disabled 狀態，目錄與特殊檔案
-//     一律 not_applicable；
-//  3. 摘要失敗不留部分結果：摘要清空、狀態 failed、錯誤碼與階段寫入條目，
+//  2. 已發佈表在發佈交易提交前完全不變：本套件只寫 entry_stage；
+//  3. 關閉 SHA256 時完全不開啟檔案內容；開啟時只讀「需要重算」的普通檔案；
+//  4. 摘要失敗不留部分結果：摘要清空、狀態 failed、錯誤碼與階段寫入條目，
 //     並記入覆蓋缺口，讓結果以「部分完成」呈現；
-//  4. 條目終態以這裡寫入的值為準，--deep 對首次建立等同全量計算。
+//  5. 刪除只在覆蓋證據充分時成立：列舉失敗、局部失敗、被排除與跨檔案系統的區域
+//     一律保留舊記錄（標為 unverified 或 excluded），絕不當成檔案已刪除；
+//  6. 排除規則改變是 excluded 語意，不是刪除；第一版不推斷移動或重命名，
+//     新路徑記新增、舊路徑記移除。
 package index
 
 import (
@@ -30,9 +33,15 @@ import (
 // errorStageHash 是摘要階段寫入條目 error_stage 的固定值。
 const errorStageHash = "hash"
 
+// defaultRetireBatch 是消失條目判定的暫存批次大小。
+const defaultRetireBatch = 256
+
 // Target 是索引內容的寫入目標，由應用層包住一次執行（run）。
 //
-// 只暴露暫存能力：正式結果只能經由發佈交易產生，索引層不得直接改寫已發佈表。
+// 它同時提供讀取已發佈條目的能力，讓索引層不必認識 store：
+//   - Lookup 以本次掃描到的路徑批次取回舊條目，用於逐條比對；
+//   - Unseen 串流列出「本次沒有再出現」的舊條目，是保守刪除的候選集合；
+//   - Stage 與 StageDeletions 只寫暫存區，正式結果仍只能經由發佈交易產生。
 type Target interface {
 	// RunID 回傳本次執行 ID，會寫入條目的 first_seen_run/last_seen_run。
 	RunID() string
@@ -40,6 +49,12 @@ type Target interface {
 	RootID() int64
 	// Stage 暫存一批條目。
 	Stage(ctx context.Context, entries []model.Entry) error
+	// StageDeletions 暫存一批待刪除路徑；實際刪除只發生在發佈交易內。
+	StageDeletions(ctx context.Context, pathKeys []string) error
+	// Lookup 依 path_key 取回已發佈條目；不存在的路徑不出現在結果裡。
+	Lookup(ctx context.Context, pathKeys []string) (map[string]model.Entry, error)
+	// Unseen 依路徑順序串流「本次沒有暫存」的已發佈條目。
+	Unseen(ctx context.Context, visit func(model.Entry) error) error
 }
 
 // Options 是一次建索引的設定。
@@ -50,8 +65,13 @@ type Options struct {
 	CasePolicy model.CasePolicy
 	// SHA256 表示是否讀取內容並保存摘要。
 	SHA256 bool
-	// Deep 表示細緻模式；首次建立時等同全量計算，但仍保留參數以記錄掃描設定。
+	// Deep 表示細緻模式：所有可讀取的普通檔案都重新計算摘要。
 	Deep bool
+	// ChangeLog 表示要保留完整的變化歷史（before/after 快照）。
+	//
+	// 關閉時只保留變化分類計數：需求要求變化日誌關閉時不長期保存完整歷史，
+	// 但執行摘要仍必須說清楚這次發生了什麼。
+	ChangeLog bool
 	// OneFileSystem 限制不跨檔案系統。
 	OneFileSystem bool
 	// Workers 是摘要 worker 數；0 表示預設 1，上限由 hash.EffectiveWorkers 夾住。
@@ -87,10 +107,29 @@ type Result struct {
 	// Entries 是已暫存的條目數，Batches 是暫存批次數。
 	Entries int64
 	Batches int64
-	// HashRequests 是送出的摘要請求數，Hashed 與 HashFailed 是終態數。
+	// HashRequests 是送出的摘要請求數，Hashed 與 HashFailed 是終態數，
+	// HashReused 是沿用舊摘要（未讀取內容）的條目數。
 	HashRequests int64
 	Hashed       int64
+	HashReused   int64
 	HashFailed   int64
+	// HashBaseline 是「原本沒有摘要、這次補上基線」的條目數，
+	// HashInvalidated 是「快速判據變化、舊摘要被清除」的條目數。
+	HashBaseline    int64
+	HashInvalidated int64
+	// 條目的變化分類計數；同一條目只會落在一個分類裡。
+	Added         int64
+	Updated       int64
+	Removed       int64
+	Excluded      int64
+	Unverified    int64
+	Unchanged     int64
+	ContentChange int64
+	MetaChange    int64
+	TypeChanged   int64
+	Restored      int64
+	// Events 是變化事件（before/after 快照）；ChangeLog 關閉時為空。
+	Events []model.Event
 	// ContentOpens 與 BytesRead 是可觀察的內容讀取證據：
 	// 關閉 SHA256 時兩者都必須是 0。
 	ContentOpens int64
@@ -99,6 +138,28 @@ type Result struct {
 
 // Partial 表示這次結果有覆蓋缺口，應以部分完成發佈。
 func (r Result) Partial() bool { return r.Coverage == model.CoveragePartial }
+
+// Changes 回傳這次是否真的有條目變化（新增、更新或移除）。
+func (r Result) Changes() bool { return r.Added > 0 || r.Updated > 0 || r.Removed > 0 }
+
+// builder 保存一次建索引過程的共用狀態。
+type builder struct {
+	target    Target
+	options   Options
+	now       func() time.Time
+	hasher    *hash.Hasher
+	counter   *hash.Counter
+	excluder  *scan.Excluder
+	result    Result
+	batchSize int
+	// regions 是「本次沒有成功覆蓋」的相對路徑前綴，保守刪除的唯一依據。
+	regions []region
+	// entriesFailed 收集條目級失敗，最後併入 coverage_json。
+	entriesFailed []scan.Gap
+	// pending 是 retired 條目的暫存緩衝。
+	pendingUpserts   []model.Entry
+	pendingDeletions []string
+}
 
 // Build 掃描根目錄並把結果寫入目標的暫存區。
 //
@@ -120,130 +181,23 @@ func Build(ctx context.Context, target Target, options Options) (Result, error) 
 	if now == nil {
 		now = time.Now
 	}
-	result := Result{}
-	var entriesFailed []scan.Gap
-	counter := &hash.Counter{}
-	var hasher *hash.Hasher
+	b := &builder{
+		target:    target,
+		options:   options,
+		now:       now,
+		excluder:  scan.NewExcluder(options.Excludes, options.CasePolicy, options.SelfFiles, options.SelfDirs),
+		batchSize: effectiveBatch(options.BatchSize),
+	}
 	if options.SHA256 {
-		hasher = hash.New(hash.Options{
+		b.counter = &hash.Counter{}
+		b.hasher = hash.New(hash.Options{
 			Workers:     options.Workers,
 			ReadRetries: options.ReadRetries,
 			BufferSize:  options.HashBufferSize,
 			Stats:       options.Stats,
-			Counter:     counter,
+			Counter:     b.counter,
 			AfterRead:   options.HashAfterRead,
 		})
-	}
-
-	sink := func(sinkCtx context.Context, batch []model.Entry) error {
-		prepared := make([]model.Entry, len(batch))
-		requests := make([]hash.Request, 0, len(batch))
-		targets := make([]int, 0, len(batch))
-		for position := range batch {
-			entry := batch[position]
-			if entry.Type != model.EntryTypeFile {
-				// 目錄、連結與特殊檔案沒有「主資料內容」，不參與摘要。
-				entry.HashSHA256 = nil
-				entry.HashState = model.HashStateNotApplicable
-				prepared[position] = entry
-				continue
-			}
-			if !options.SHA256 {
-				// 明確的「未啟用」狀態：沒有讀過內容，也沒有任何摘要可比較。
-				entry.HashSHA256 = nil
-				entry.HashState = model.HashStateDisabled
-				prepared[position] = entry
-				continue
-			}
-			entry.HashState = model.HashStateNotComputed
-			identity, hasIdentity := hash.IdentityOfEntry(entry)
-			request := hash.Request{AbsPath: entry.AbsPath, Size: entry.Size, Mtime: entry.Mtime}
-			if hasIdentity {
-				request.Identity = identity
-			}
-			requests = append(requests, request)
-			targets = append(targets, position)
-			prepared[position] = entry
-		}
-
-		if len(requests) > 0 {
-			results, err := hasher.Compute(sinkCtx, requests)
-			if err != nil {
-				return err
-			}
-			result.HashRequests += int64(len(requests))
-			for position := range results {
-				outcome := results[position]
-				entry := &prepared[targets[position]]
-				if outcome.Computed() {
-					digest := outcome.Digest
-					entry.HashSHA256 = &digest
-					entry.HashState = model.HashStateComputed
-					computedAt := model.NewTimestamp(now())
-					entry.HashComputedAt = &computedAt
-					size := outcome.Size
-					entry.HashSize = &size
-					if outcome.Mtime != "" {
-						mtime := outcome.Mtime
-						entry.HashMTime = &mtime
-					}
-					entry.ErrorCode = nil
-					entry.ErrorStage = nil
-					result.Hashed++
-					observe(options.Observe, model.OpHashed, entry.RelPath)
-					continue
-				}
-				code := outcome.Code
-				if code == "" {
-					code = model.CodeHashRead
-				}
-				codeText := string(code)
-				stage := errorStageHash
-				entry.HashSHA256 = nil
-				entry.HashState = model.HashStateFailed
-				entry.HashComputedAt = nil
-				entry.HashSize = nil
-				entry.HashMTime = nil
-				entry.ErrorCode = &codeText
-				entry.ErrorStage = &stage
-				entriesFailed = append(entriesFailed, scan.Gap{
-					RelPath: entry.RelPath,
-					Code:    code,
-					Detail:  outcome.Detail,
-				})
-				result.HashFailed++
-				if options.Stats != nil {
-					options.Stats.AddErrorEvent(1)
-				}
-				observe(options.Observe, model.OpFailed, entry.RelPath)
-			}
-		}
-
-		if err := target.Stage(sinkCtx, prepared); err != nil {
-			return err
-		}
-		result.Entries += int64(len(prepared))
-		result.Batches++
-		for position := range prepared {
-			observe(options.Observe, model.OpAdded, prepared[position].RelPath)
-		}
-		return nil
-	}
-
-	onEvent := func(event scan.Event) {
-		switch event.Kind {
-		case scan.EventEntryFailed:
-			entriesFailed = append(entriesFailed, scan.Gap{
-				RelPath: event.RelPath,
-				Code:    event.Code,
-				Detail:  event.Detail,
-			})
-			observe(options.Observe, model.OpFailed, event.RelPath)
-		case scan.EventDirFailed:
-			observe(options.Observe, model.OpFailed, event.RelPath)
-		case scan.EventEntryExcluded:
-			observe(options.Observe, model.OpExcluded, event.RelPath)
-		}
 	}
 
 	walked, walkErr := scan.Walk(ctx, scan.Options{
@@ -255,34 +209,119 @@ func Build(ctx context.Context, target Target, options Options) (Result, error) 
 		SelfDirs:      options.SelfDirs,
 		OneFileSystem: options.OneFileSystem,
 		BatchSize:     options.BatchSize,
-		Sink:          sink,
-		OnEvent:       onEvent,
+		Sink:          b.consume,
+		OnEvent:       b.onEvent,
 		Stats:         options.Stats,
 		Now:           now,
 	})
-	result.Scan = walked
-	result.ContentOpens = counter.Opens()
-	result.BytesRead = counter.Bytes()
+	b.result.Scan = walked
+	if b.counter != nil {
+		b.result.ContentOpens = b.counter.Opens()
+		b.result.BytesRead = b.counter.Bytes()
+	}
 	if walkErr != nil {
-		result.Coverage = model.CoverageUnknown
-		return result, walkErr
+		b.result.Coverage = model.CoverageUnknown
+		return b.result, walkErr
+	}
+
+	// 保守刪除只在整棵樹走完之後才可能成立：中途中止時沒有任何覆蓋證據。
+	b.regions = b.buildRegions(walked.Coverage)
+	if err := b.retire(ctx); err != nil {
+		b.result.Coverage = model.CoverageUnknown
+		return b.result, err
 	}
 
 	coverage := walked.Coverage
-	coverage.FailedEntries = append(coverage.FailedEntries, entriesFailed...)
+	coverage.FailedEntries = append(coverage.FailedEntries, b.entriesFailed...)
 	// 被排除的目錄仍然記進 coverage（保守刪除判定需要它），但那是使用者自己要的
 	// 排除，不是「這次沒能覆蓋」，因此不讓它把結果降級成部分完成。
 	if incompleteCoverage(coverage, walked.EntryErrors) {
-		result.Coverage = model.CoveragePartial
+		b.result.Coverage = model.CoveragePartial
 	} else {
-		result.Coverage = model.CoverageComplete
+		b.result.Coverage = model.CoverageComplete
 	}
 	encoded, err := coverage.JSON()
 	if err != nil {
-		return result, internalError("coverage JSON: " + err.Error())
+		return b.result, internalError("coverage JSON: " + err.Error())
 	}
-	result.CoverageJSON = encoded
-	return result, nil
+	b.result.CoverageJSON = encoded
+	if b.counter != nil {
+		b.result.ContentOpens = b.counter.Opens()
+		b.result.BytesRead = b.counter.Bytes()
+	}
+	return b.result, nil
+}
+
+// consume 處理一批掃描到的條目：比對舊值、決定摘要、分類、暫存。
+func (b *builder) consume(ctx context.Context, batch []model.Entry) error {
+	keys := make([]string, len(batch))
+	for position := range batch {
+		keys[position] = batch[position].PathKey
+	}
+	published, err := b.target.Lookup(ctx, keys)
+	if err != nil {
+		return err
+	}
+	plans := make([]plan, len(batch))
+	requests := make([]hash.Request, 0, len(batch))
+	targets := make([]int, 0, len(batch))
+	for position := range batch {
+		old, exists := published[batch[position].PathKey]
+		plans[position] = b.planEntry(batch[position], old, exists)
+		if !plans[position].computeHash {
+			continue
+		}
+		request := hash.Request{AbsPath: plans[position].entry.AbsPath, Size: plans[position].entry.Size, Mtime: plans[position].entry.Mtime}
+		if identity, ok := hash.IdentityOfEntry(plans[position].entry); ok {
+			request.Identity = identity
+		}
+		requests = append(requests, request)
+		targets = append(targets, position)
+	}
+
+	if len(requests) > 0 {
+		results, err := b.hasher.Compute(ctx, requests)
+		if err != nil {
+			return err
+		}
+		b.result.HashRequests += int64(len(requests))
+		for position := range results {
+			b.applyHash(&plans[targets[position]], results[position])
+		}
+	}
+
+	prepared := make([]model.Entry, len(plans))
+	for position := range plans {
+		prepared[position] = plans[position].entry
+	}
+	if err := b.target.Stage(ctx, prepared); err != nil {
+		return err
+	}
+	b.result.Entries += int64(len(prepared))
+	b.result.Batches++
+	for position := range plans {
+		if err := b.finish(&plans[position]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// onEvent 把掃描事件轉成索引層的可觀察輸出與覆蓋缺口。
+func (b *builder) onEvent(event scan.Event) {
+	switch event.Kind {
+	case scan.EventEntryFailed:
+		b.entriesFailed = append(b.entriesFailed, scan.Gap{
+			RelPath: event.RelPath,
+			Code:    event.Code,
+			Detail:  event.Detail,
+		})
+		observe(b.options.Observe, model.OpFailed, event.RelPath)
+	case scan.EventDirFailed:
+		observe(b.options.Observe, model.OpFailed, event.RelPath)
+	case scan.EventEntryExcluded:
+		observe(b.options.Observe, model.OpExcluded, event.RelPath)
+	}
 }
 
 // incompleteCoverage 判斷是否有「非使用者選擇」的覆蓋缺口。
@@ -293,6 +332,14 @@ func incompleteCoverage(coverage scan.Coverage, entryErrors int64) bool {
 		len(coverage.FailedDirs) > 0 ||
 		len(coverage.FailedEntries) > 0 ||
 		entryErrors > 0
+}
+
+// effectiveBatch 套用批次預設值。
+func effectiveBatch(requested int) int {
+	if requested > 0 {
+		return requested
+	}
+	return defaultRetireBatch
 }
 
 // observe 在設定回呼時回報一次條目終態。

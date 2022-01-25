@@ -371,10 +371,10 @@ func firstLines(text string, count int) string {
 	return strings.Join(lines, " | ")
 }
 
-// TestIndexCommandEndToEnd 驗證 index 從參數解析一路走到發佈。
+// TestIndexCommandEndToEnd 驗證 index 從參數解析一路走到發佈與更新。
 //
 // 這是唯一會實際建立資料庫的命令路徑：stdout 必須保持乾淨，
-// 診斷與統計走 stderr，重跑時明確拒絕而不是覆蓋。
+// 診斷與統計走 stderr，第二次執行是增量更新而不是重建。
 func TestIndexCommandEndToEnd(t *testing.T) {
 	withSystemLanguage(t, "")
 	dir := t.TempDir()
@@ -410,12 +410,27 @@ func TestIndexCommandEndToEnd(t *testing.T) {
 		}
 	}
 
+	// 第二次執行是增量更新：沒有變化時仍然產生新代次，但摘要全部複用。
 	second := runCLI(t, []string{"-l", "en-US", "index", dir}, nil)
-	if second.code != 1 {
-		t.Fatalf("second index exit code = %d, want 1", second.code)
+	if second.code != 0 {
+		t.Fatalf("second index exit code = %d, want 0 (stderr %q)", second.code, firstLines(second.stderr, 3))
 	}
-	if !strings.Contains(second.stderr, "E_UPDATE_NOT_SUPPORTED") {
-		t.Errorf("second run must explain that updates are not implemented: %q", second.stderr)
+	for _, want := range []string{"Published generation 2", "Changes: added 0", "quick mode"} {
+		if !strings.Contains(second.stderr, want) {
+			t.Errorf("second run is missing %q: %q", want, firstLines(second.stderr, 6))
+		}
+	}
+	if !strings.Contains(second.stderr, "kept their stored SHA256") {
+		t.Errorf("second run must report digest reuse: %q", firstLines(second.stderr, 6))
+	}
+	again := runCLI(t, []string{"-l", "en-US", "info", "--db", dbPath}, nil)
+	if again.code != 0 {
+		t.Fatalf("info exit code = %d (stderr %q)", again.code, again.stderr)
+	}
+	for _, want := range []string{"generation: 2", "index_state: complete", "entries: 2"} {
+		if !strings.Contains(again.stdout, want) {
+			t.Errorf("info output is missing %q: %q", want, again.stdout)
+		}
 	}
 }
 

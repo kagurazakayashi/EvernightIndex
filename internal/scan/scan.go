@@ -322,8 +322,7 @@ type walker struct {
 	opts       Options
 	root       Root
 	rootVolume string
-	selfFiles  map[string]struct{}
-	selfDirs   []string
+	excluder   *Excluder
 	batchSize  int
 	messages   chan message
 	pending    atomic.Int64
@@ -378,7 +377,7 @@ func Walk(ctx context.Context, opts Options) (Result, error) {
 		cancel:     cancel,
 	}
 	w.queueCond = sync.NewCond(&w.queueMu)
-	w.selfFiles, w.selfDirs = buildSelfSets(normalized.SelfFiles, normalized.SelfDirs, normalized.CasePolicy)
+	w.excluder = NewExcluder(normalized.Excludes, normalized.CasePolicy, normalized.SelfFiles, normalized.SelfDirs)
 	if volume, ok := fsmeta.VolumeOf(root.Info); ok {
 		w.rootVolume = volume
 	}
@@ -650,22 +649,11 @@ func (w *walker) pushDir(ctx context.Context, relPath, absPath string, info fsme
 
 // exclude 判斷一個子項是否被排除，並回報原因。
 //
-// 先比對自產檔案與目錄（精確路徑／前綴），再用顯式模式比對相對路徑。
-// 目錄被排除時不會進入，因此其後代既不會出現，也不會被判定為刪除。
+// 規則本身住在 Excluder，索引層用同一個型別判定舊條目是否因排除規則改變而移出，
+// 兩邊因此不可能出現不一致。目錄被排除時不會進入，其後代既不會出現，
+// 也不會被判定為刪除。
 func (w *walker) exclude(absPath, relPath string, isDir bool) (ExcludeReason, bool) {
-	folded := foldPath(absPath, w.opts.CasePolicy)
-	if _, ok := w.selfFiles[folded]; ok {
-		return ExcludeReasonSelfProduced, true
-	}
-	for _, dir := range w.selfDirs {
-		if folded == dir || strings.HasPrefix(folded, dir+"/") {
-			return ExcludeReasonSelfProduced, true
-		}
-	}
-	if w.opts.Excludes != nil && w.opts.Excludes.MatchPath(relPath, isDir) {
-		return ExcludeReasonPattern, true
-	}
-	return "", false
+	return w.excluder.Match(absPath, relPath, isDir)
 }
 
 // entryFor 由中繼資料組出一筆條目：路徑欄位由掃描層負責，其餘由 fsmeta 填寫。

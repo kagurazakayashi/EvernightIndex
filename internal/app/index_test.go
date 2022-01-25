@@ -125,8 +125,159 @@ func TestIndexCommandCreatesDatabase(t *testing.T) {
 	}
 }
 
-// TestIndexRejectsExistingIndex 驗證既有索引不被重建或覆蓋。
-func TestIndexRejectsExistingIndex(t *testing.T) {
+// openIndex 以唯讀方式開啟索引，測試結束時自動關閉。
+func openIndex(t *testing.T, ctx context.Context, dbPath string) (*store.Store, model.Root) {
+	t.Helper()
+	storage, err := store.Open(ctx, dbPath, store.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("open index: %v", err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	bound, found, err := storage.Root(ctx)
+	if err != nil || !found {
+		t.Fatalf("read bound root: %v (found %v)", err, found)
+	}
+	return storage, bound
+}
+
+// TestIndexUpdatesExistingIndex 驗證第二次執行是增量更新，不是重建。
+func TestIndexUpdatesExistingIndex(t *testing.T) {
+	deps, _, stderr := newTestDeps(t)
+	service := New(deps)
+	rootDir := t.TempDir()
+	writeSample(t, rootDir, "a.txt", "a")
+	ctx := context.Background()
+	if err := runIndexCommand(t, service, ctx, rootDir, indexOptions()); err != nil {
+		t.Fatalf("first index: %v", err)
+	}
+	stderr.Reset()
+	writeSample(t, rootDir, "b.txt", "b")
+	// 未變動的檔案不該被重新讀取；新增的檔案必須計算摘要。
+	if err := runIndexCommand(t, service, ctx, rootDir, indexOptions()); err != nil {
+		t.Fatalf("second index run must update the existing index: %v", err)
+	}
+
+	dbPath := filepath.Join(rootDir, "index.db")
+	storage, bound := openIndex(t, ctx, dbPath)
+	generation, err := storage.PublishedGeneration(ctx)
+	if err != nil || generation != 2 {
+		t.Fatalf("published generation = %d (err %v), want 2", generation, err)
+	}
+	total, err := storage.CountPublished(ctx, bound.ID)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if total != 3 {
+		t.Errorf("published entries = %d, want 3 (root, a.txt, b.txt)", total)
+	}
+	added, found, err := storage.PublishedEntry(ctx, bound.ID, model.PathKey("b.txt", bound.CasePolicy))
+	if err != nil || !found {
+		t.Fatalf("b.txt: %v (found %v)", err, found)
+	}
+	if added.HashState != model.HashStateComputed || added.HashSHA256 == nil {
+		t.Errorf("b.txt hash = %s %v, want a computed digest", added.HashState, added.HashSHA256)
+	}
+	reused, _, err := storage.PublishedEntry(ctx, bound.ID, model.PathKey("a.txt", bound.CasePolicy))
+	if err != nil {
+		t.Fatalf("a.txt: %v", err)
+	}
+	if reused.HashState != model.HashStateReused {
+		t.Errorf("a.txt hash state = %s, want reused (quick mode, unchanged criteria)", reused.HashState)
+	}
+	if reused.FirstSeenRun == added.FirstSeenRun {
+		t.Errorf("first seen run must not be rewritten by an update (both %q)", reused.FirstSeenRun)
+	}
+	if !strings.Contains(stderr.String(), "变化") {
+		t.Errorf("an update must report what changed: %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "快速模式") {
+		t.Errorf("quick mode must explain that it cannot detect every content change: %q", stderr.String())
+	}
+}
+
+// TestIndexUpdateRemovesDeletedEntries 驗證消失的路徑在更新後從已發佈索引移除。
+func TestIndexUpdateRemovesDeletedEntries(t *testing.T) {
+	deps, _, _ := newTestDeps(t)
+	service := New(deps)
+	rootDir := t.TempDir()
+	writeSample(t, rootDir, "keep.txt", "keep")
+	gone := writeSample(t, rootDir, "gone.txt", "gone")
+	ctx := context.Background()
+	if err := runIndexCommand(t, service, ctx, rootDir, indexOptions()); err != nil {
+		t.Fatalf("first index: %v", err)
+	}
+	if err := os.Remove(gone); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := runIndexCommand(t, service, ctx, rootDir, indexOptions()); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	dbPath := filepath.Join(rootDir, "index.db")
+	storage, bound := openIndex(t, ctx, dbPath)
+	if _, found, err := storage.PublishedEntry(ctx, bound.ID, model.PathKey("gone.txt", bound.CasePolicy)); err != nil || found {
+		t.Errorf("gone.txt is still published (found %v, err %v)", found, err)
+	}
+	if _, found, err := storage.PublishedEntry(ctx, bound.ID, model.PathKey("keep.txt", bound.CasePolicy)); err != nil || !found {
+		t.Errorf("keep.txt disappeared (found %v, err %v)", found, err)
+	}
+}
+
+// TestIndexUpdateMarksExcludedEntries 驗證排除規則改變是 excluded，不是刪除。
+func TestIndexUpdateMarksExcludedEntries(t *testing.T) {
+	deps, _, _ := newTestDeps(t)
+	service := New(deps)
+	rootDir := t.TempDir()
+	writeSample(t, rootDir, "keep.txt", "keep")
+	writeSample(t, rootDir, "skip.tmp", "skip")
+	ctx := context.Background()
+	if err := runIndexCommand(t, service, ctx, rootDir, indexOptions()); err != nil {
+		t.Fatalf("first index: %v", err)
+	}
+	options := indexOptions()
+	options.Excludes = []string{"*.tmp"}
+	if err := runIndexCommand(t, service, ctx, rootDir, options); err != nil {
+		t.Fatalf("update with an exclusion: %v", err)
+	}
+	dbPath := filepath.Join(rootDir, "index.db")
+	storage, bound := openIndex(t, ctx, dbPath)
+	entry, found, err := storage.PublishedEntry(ctx, bound.ID, model.PathKey("skip.tmp", bound.CasePolicy))
+	if err != nil || !found {
+		t.Fatalf("skip.tmp was deleted instead of being marked excluded (found %v, err %v)", found, err)
+	}
+	if entry.Status != model.StatusExcluded {
+		t.Errorf("skip.tmp status = %s, want excluded", entry.Status)
+	}
+}
+
+// TestIndexRejectsWrongRoot 驗證資料庫綁定的根目錄不同時拒絕更新。
+func TestIndexRejectsWrongRoot(t *testing.T) {
+	deps, _, _ := newTestDeps(t)
+	service := New(deps)
+	firstDir := t.TempDir()
+	writeSample(t, firstDir, "a.txt", "a")
+	dbPath := filepath.Join(t.TempDir(), "shared.db")
+	ctx := context.Background()
+	options := indexOptions()
+	options.DB = dbPath
+	if err := runIndexCommand(t, service, ctx, firstDir, options); err != nil {
+		t.Fatalf("first index: %v", err)
+	}
+	otherDir := t.TempDir()
+	writeSample(t, otherDir, "b.txt", "b")
+	err := runIndexCommand(t, service, ctx, otherDir, options)
+	appErr, ok := err.(*model.Error)
+	if !ok || appErr.Code != model.CodeRootMismatch {
+		t.Fatalf("error = %v, want %s", err, model.CodeRootMismatch)
+	}
+	storage, _ := openIndex(t, ctx, dbPath)
+	generation, _ := storage.PublishedGeneration(ctx)
+	if generation != 1 {
+		t.Errorf("published generation = %d, want 1 (a refused run must change nothing)", generation)
+	}
+}
+
+// TestIndexUpdateFailureKeepsPreviousGeneration 驗證更新失敗時舊版完整可用。
+func TestIndexUpdateFailureKeepsPreviousGeneration(t *testing.T) {
 	deps, _, _ := newTestDeps(t)
 	service := New(deps)
 	rootDir := t.TempDir()
@@ -135,33 +286,54 @@ func TestIndexRejectsExistingIndex(t *testing.T) {
 	if err := runIndexCommand(t, service, ctx, rootDir, indexOptions()); err != nil {
 		t.Fatalf("first index: %v", err)
 	}
-	// 第二次執行前加入一個新檔案：資料庫不得被重建，因此它不會出現在索引裡。
 	writeSample(t, rootDir, "b.txt", "b")
-	err := runIndexCommand(t, service, ctx, rootDir, indexOptions())
-	if err == nil {
-		t.Fatal("a second index run must not rebuild an existing index")
-	}
-	appErr, ok := err.(*model.Error)
-	if !ok || appErr.Code != model.CodeUpdateNotSupported || appErr.ExitCode() != model.ExitFatal {
-		t.Fatalf("error = %v, want %s with exit code 1", err, model.CodeUpdateNotSupported)
-	}
+	dbPath := filepath.Join(rootDir, "index.db")
 
-	storage, openErr := store.Open(ctx, filepath.Join(rootDir, "index.db"), store.Options{ReadOnly: true})
-	if openErr != nil {
-		t.Fatalf("open index: %v", openErr)
+	// 以另一個連線持有寫入交易，模擬「資料庫目前不能寫入」。
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=busy_timeout(0)")
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
 	}
-	defer func() { _ = storage.Close() }()
-	generation, _ := storage.PublishedGeneration(ctx)
-	if generation != 1 {
-		t.Errorf("published generation = %d, want 1 (unchanged)", generation)
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("connection: %v", err)
 	}
-	bound, _, _ := storage.Root(ctx)
-	total, countErr := storage.CountPublished(ctx, bound.ID)
-	if countErr != nil {
-		t.Fatalf("count: %v", countErr)
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("begin immediate: %v", err)
+	}
+	runErr := runIndexCommand(t, service, ctx, rootDir, indexOptions())
+	if _, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK"); rollbackErr != nil {
+		t.Fatalf("rollback: %v", rollbackErr)
+	}
+	if runErr == nil {
+		t.Fatal("a database write failure must be reported")
+	}
+	if code := model.ExitCodeOf(runErr); code != model.ExitFatal {
+		t.Errorf("exit code = %d, want %d (error %v)", code, model.ExitFatal, runErr)
+	}
+	storage, bound := openIndex(t, ctx, dbPath)
+	generation, err := storage.PublishedGeneration(ctx)
+	if err != nil || generation != 1 {
+		t.Errorf("published generation = %d (err %v), want 1", generation, err)
+	}
+	total, err := storage.CountPublished(ctx, bound.ID)
+	if err != nil {
+		t.Fatalf("count: %v", err)
 	}
 	if total != 2 {
-		t.Errorf("published entries = %d, want 2 (the rejected run must not add anything)", total)
+		t.Errorf("published entries = %d, want 2 (the failed update must not publish)", total)
+	}
+	if _, found, err := storage.PublishedEntry(ctx, bound.ID, model.PathKey("b.txt", bound.CasePolicy)); err != nil || found {
+		t.Errorf("b.txt was published by a failed run (found %v, err %v)", found, err)
+	}
+	latest, found, err := storage.LatestRun(ctx)
+	if err != nil {
+		t.Fatalf("latest run: %v", err)
+	}
+	if found && latest.Generation != nil && *latest.Generation > 1 {
+		t.Errorf("latest run published generation %d; a failed update must not publish", *latest.Generation)
 	}
 }
 

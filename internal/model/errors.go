@@ -88,8 +88,6 @@ const (
 	CodeHashRead ErrorCode = "E_HASH_READ"
 	// CodeHashUnstable 表示讀取期間檔案持續變動，摘要不可信。
 	CodeHashUnstable ErrorCode = "E_HASH_UNSTABLE"
-	// CodeUpdateNotSupported 表示目標資料庫已含已發佈索引，但增量更新尚未實作。
-	CodeUpdateNotSupported ErrorCode = "E_UPDATE_NOT_SUPPORTED"
 	// CodeInternal 表示不應發生的內部錯誤。
 	CodeInternal ErrorCode = "E_INTERNAL"
 	// CodeInterrupted 表示使用者中斷。
